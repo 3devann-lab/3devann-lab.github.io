@@ -44,14 +44,23 @@ any point in the song. Practice runs and speeds below 1x don't save high scores.
 - **Start**: pick a song file (.ogg/.egg/.mp3/.wav). The BPM is detected for you (or tap it), a cover is made if you
   don't have one. You can also **import a map zip** or **edit any downloaded map** (v2, v3 and v4 maps, BPM changes
   included).
-- **Timeline** (time flows up, like ChroMapper): note lanes for the bottom / middle / top rows, walls, and nine light
-  lanes, next to the song's waveform. **Click** to place, **drag while placing** to aim a note or size a wall,
-  **right-click / right-drag** to delete, **Shift-drag** to select, drag a selection to move it.
-- **3D preview**: the map plays in the real game engine next to the timeline — scrub and it shows that exact moment.
+- **A full 3D editor**: the map sits on a track in front of you, in the real game engine with its lights and
+  environment. The glowing 4×3 grid is the cursor; what's coming sits on the track ahead, the light lanes run down the
+  right side, the song's waveform and beat numbers down the left.
+  - **Click a cell** of the grid to place a note or bomb, **drag** while placing to aim it.
+  - **Wall tool (4)**: drag along the track to draw a wall across lanes and beats.
+  - **Lights**: click the light lanes; each lane glows the way that light is at the cursor.
+  - **Wheel** moves through the song (Ctrl+wheel stretches the track). **Click the track ahead** to jump there.
+    Drag the waveform strip to scroll, or click the song strip under the view to go anywhere.
+  - **Right-click** deletes; a right-drag that starts on an object deletes everything it sweeps over. **Shift-drag** box-selects.
+  - **Drag a note** to another lane / row; drag walls and lights to move them in time. **Double-click** jumps to an object.
+  - **Camera**: right-drag on empty space to turn it, middle-drag to pan, right button + wheel to zoom.
+    Presets: Default, Top (reads like a 2D timeline), Side (timing at a glance), Player. **R** resets.
+  - **Game view (G)**: see the map exactly as the game draws it, then press G to keep editing.
 - **Objects**: red/blue notes (9 directions + angle offset), bombs, full/crouch walls, arcs and chains, light events
   (blue/red/white, on/flash/fade/transition, brightness, laser speed, ring spin/zoom), Chroma colours, BPM changes,
   bookmarks.
-- **Tools**: undo/redo, copy/cut/paste at the cursor, mirror, swap colours, snap to grid (1/1–1/64), zoom, playback
+- **Tools**: undo/redo, copy/cut/paste at the cursor, mirror, swap colours, snap to grid (1/1–1/64), playback
   at 0.25x–1x with hitsounds and a metronome, strobe generator, light show from your notes, a 4×3 grid view at the
   cursor, an inspector for exact values, stats with jump distance / reaction time, and a map checker (stacked notes,
   notes in walls, too-short walls, impossible doubles).
@@ -155,7 +164,7 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - `js/game.js` — 3D engine, environment, lighting, gameplay, replay playback
 - `js/menu.js` — all UI screens (incl. the replay browser)
 - `js/replayui.js` — replay viewer controls (timeline, speed, cameras, live options)
-- `js/editor/` — map editor: `model.js` (project data, undo, import / export), `timeline.js` (the canvas timeline),
+- `js/editor/` — map editor: `model.js` (project data, undo, import / export), `view3d.js` (the 3D editing view), `overview.js` (the song strip),
   `editor.js` (screens, tools, playback, 3D preview, saving)
 - `js/ui.js` — shared UI pieces (toasts, setting rows, camera/replay option lists)
 - `js/beatmap.js` — v2/v3/v4 map parser (Chroma + Noodle)

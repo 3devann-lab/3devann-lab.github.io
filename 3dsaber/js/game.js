@@ -16,7 +16,7 @@ import { settings } from './settings.js';
 // Notes arrive on the beat at HIT_Z. Everything Beat Saber places relative to
 // the player (notes, walls, Noodle tracks, world rotations, the player rig)
 // lives under a root at that point, so rotations pivot where they should.
-const HIT_Z = -1.6;
+export const HIT_Z = -1.6;
 // Chroma environment pieces are anchored at the camera instead, so scenery a
 // map puts around/behind the player never ends up between camera and sabers.
 const ENV_Z_ORIGIN = 4.0;
@@ -570,7 +570,9 @@ export class Engine {
             samples: this.renderer.capabilities.isWebGL2 ? this.q.msaa : 0,
         });
         this.composer = new EffectComposer(this.renderer, rt);
-        this.composer.addPass(new RenderPass(this.scene, this.camera));
+        this.renderPass = new RenderPass(this.scene, this.camera);
+        this.composer.addPass(this.renderPass);
+        this.viewCam = null;          // a camera that replaces the play camera (the map editor's)
         this.bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.5, 0.45, 0.35);
         if (this.renderer.capabilities.isWebGL2 && this.bloom.materialHighPassFilter) {
             this.bloom.materialHighPassFilter.fragmentShader = SAFE_HIGHPASS_FRAG;   // needs GLSL ES 3 isnan/isinf
@@ -680,15 +682,25 @@ export class Engine {
 
     applyView() {
         const b = this.viewBox;
-        if (b) {
-            this.camera.aspect = b.w / b.h;
-            this.camera.setViewOffset(b.w, b.h, -b.x, -b.y, innerWidth, innerHeight);
-        } else {
-            this.camera.aspect = innerWidth / innerHeight;
-            this.camera.clearViewOffset();
+        for (const cam of this.viewCam ? [this.camera, this.viewCam] : [this.camera]) {
+            if (b) {
+                cam.aspect = b.w / b.h;
+                cam.setViewOffset(b.w, b.h, -b.x, -b.y, innerWidth, innerHeight);
+            } else {
+                cam.aspect = innerWidth / innerHeight;
+                cam.clearViewOffset();
+            }
+            cam.updateProjectionMatrix();
         }
-        this.camera.updateProjectionMatrix();
     }
+
+    // Draw the frame from another camera (the map editor's), or null for the play camera
+    useCamera(cam) {
+        this.viewCam = cam || null;
+        this.renderPass.camera = this.drawCamera;
+        this.applyView();
+    }
+    get drawCamera() { return this.viewCam || this.camera; }
 
     applySize() {
         this.applyView();
@@ -1035,10 +1047,11 @@ export class Engine {
         // Refraction pre-pass: capture the scene without distortion walls so
         // the wall shader can warp what's behind them (like the real game).
         const fancy = this.gameplay && this.gameplay.wallBatches && this.gameplay.wallBatches.fancy.mesh;
-        if (fancy && fancy.count > 0 && this.frame % this.q.refrEvery === 0) {
+        const cam = this.drawCamera;
+        if (fancy && fancy.visible && fancy.count > 0 && this.frame % this.q.refrEvery === 0) {
             fancy.visible = false;
             this.renderer.setRenderTarget(this.refractionRT);
-            this.renderer.render(this.scene, this.camera);
+            this.renderer.render(this.scene, cam);
             this.renderer.setRenderTarget(null);
             fancy.visible = true;
         }
@@ -1053,7 +1066,7 @@ export class Engine {
             }
         }
         this.renderer.setRenderTarget(null);
-        this.renderer.render(this.scene, this.camera);
+        this.renderer.render(this.scene, cam);
     }
 }
 
@@ -1556,6 +1569,14 @@ export class Gameplay {
         // practice: jump in a couple of seconds before the chosen moment
         if (!this.replay && this.mods.practiceStart > 0) this.seek(this.mods.practiceStart - 2.5);
     }
+
+    // the map editor draws its own notes; the preview then only runs the lights
+    set hideObjects(v) {
+        this._hideObjects = !!v;
+        this.objRoot.visible = !v;
+        if (v) for (const b of Object.values(this.wallBatches)) b.mesh.visible = false;
+    }
+    get hideObjects() { return !!this._hideObjects; }
 
     // feel, look and sound options that apply to every level (Settings)
     applyPlaySettings() {
@@ -2495,6 +2516,7 @@ export class Gameplay {
         }
         B.fancy.end();
         B.plain.end();
+        if (this._hideObjects) B.fancy.mesh.visible = B.plain.mesh.visible = false;
     }
 
     bumpMultiplier() {

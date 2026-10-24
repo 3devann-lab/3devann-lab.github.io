@@ -1,4 +1,4 @@
-// ============ Map editor: screens, tools, playback, 3D preview, save / export ============
+// ============ Map editor: screens, tools, playback, the 3D view, save / export ============
 import { audio } from '../audio.js';
 import { cursor, gamepad } from '../input.js';
 import { settings } from '../settings.js';
@@ -7,7 +7,8 @@ import { Gameplay } from '../game.js';
 import { getSavedMaps, idb, PROJECT_STORE, PROJECT_FILES, saveLibraryRecord, deleteSavedMap } from '../beatsaver.js';
 import { toast, esc } from '../ui.js';
 import * as M from './model.js';
-import { Timeline, dirFromDrag } from './timeline.js';
+import { View3D, dirFromDrag } from './view3d.js';
+import { Overview } from './overview.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -206,7 +207,7 @@ export class Editor {
         this.diffIndex = 0;
         this.cursorBeat = 0;
         this.snap = 4;
-        this.zoom = 120;
+        this.spacing = 2;                 // metres of track per beat in the 3D view
         this.tool = 'red';
         this.dir = 1;
         this.angle = 0;
@@ -272,7 +273,7 @@ export class Editor {
         if (!list.length) {
             box.innerHTML = `<div class="ed-empty">
                 <h3>Make your own Beat Saber maps</h3>
-                <p>Pick a song, place notes, walls, bombs and lights on the timeline, watch it in 3D as you go, and test-play it any time.
+                <p>Pick a song, place notes, walls, bombs and lights on a 3D track (lights and all, like in the game), and test-play it any time.
                 Your maps save automatically, show up in <b>Play</b>, and export as a zip that works in Beat Saber and ChroMapper.</p>
                 <button class="btn primary" id="ed-new2">+ Start a New Map</button>
             </div>`;
@@ -497,7 +498,7 @@ export class Editor {
             this.diffIndex = Math.min(st.diff || 0, p.diffs.length - 1);
             this.cursorBeat = st.cursor || 0;
             this.snap = st.snap || 4;
-            this.zoom = st.zoom || 120;
+            this.spacing = st.spacing || 2;
             this._clock = null;
             this.sel.clear();
             this.history = new M.History();
@@ -515,6 +516,8 @@ export class Editor {
         this.active = false;
         this.pause();
         this.destroyPreview();
+        if (this.view) { this.view.dispose(); this.view = null; }
+        this.overview = null;
         this.engine.setViewBox(null);
         removeEventListener('keydown', this._onKey, true);
         removeEventListener('resize', this._onResize);
@@ -553,9 +556,26 @@ export class Editor {
             </div>
             <div class="ed-main">
                 <div class="ed-left" id="ed-left"></div>
-                <div class="ed-center" id="ed-center"><canvas id="ed-canvas"></canvas></div>
+                <div class="ed-center" id="ed-center">
+                    <div class="ed-view" id="ed-view"></div>
+                    <div class="ed-viewbar" id="ed-viewbar">
+                        <div class="ed-seg ed-modes">
+                            <button class="ed-chip active" data-mode="edit" title="Edit the map in 3D">Edit</button>
+                            <button class="ed-chip" data-mode="game" title="See it exactly as the game shows it (G)">Game view</button>
+                        </div>
+                        <div class="ed-seg ed-cams">
+                            <button class="ed-chip" data-cam="edit" title="Behind the grid (R)">Default</button>
+                            <button class="ed-chip" data-cam="top" title="Looking down the track">Top</button>
+                            <button class="ed-chip" data-cam="side" title="From the side: timing at a glance">Side</button>
+                            <button class="ed-chip" data-cam="player" title="Where the player stands">Player</button>
+                        </div>
+                        <label class="ed-mini ed-spacing" title="Track length per beat (Ctrl+wheel, − =)">Spacing
+                            <input type="range" id="ed-spacing" min="0.4" max="8" step="0.05"></label>
+                    </div>
+                    <div class="ed-viewhint" id="ed-viewhint"></div>
+                    <canvas class="ed-overview" id="ed-overview" title="The whole song — click or drag to go there"></canvas>
+                </div>
                 <div class="ed-right">
-                    <div class="ed-preview" id="ed-preview"><span class="ed-preview-label">3D PREVIEW</span></div>
                     <div class="ed-tabs" id="ed-tabs">
                         ${[['inspect', 'Inspect'], ['grid', 'Grid'], ['stats', 'Stats'], ['checks', 'Checks']].map(([k, l]) =>
                             `<button class="ed-tab" data-tab="${k}">${l}</button>`).join('')}
@@ -571,7 +591,8 @@ export class Editor {
         document.body.classList.add('editing');
         $('hud').classList.add('hidden');
 
-        this.timeline = new Timeline($('ed-canvas'), this);
+        this.view = new View3D(this, $('ed-view'));
+        this.overview = new Overview($('ed-overview'), this);
         this.active = true;
         this.bindTop();
         this.renderTools();
@@ -580,23 +601,53 @@ export class Editor {
         addEventListener('keydown', this._onKey, true);
         addEventListener('resize', this._onResize);
         this._ro = new ResizeObserver(() => this.layout());
-        this._ro.observe($('ed-center'));
-        this._ro.observe($('ed-preview'));
+        this._ro.observe($('ed-view'));
         this.layout();
-        this.status('Click a cell to place · drag while placing to aim · right-click (or right-drag) deletes · Shift-drag selects · wheel scrolls, Ctrl+wheel zooms');
+        this.setViewMode('edit');
+        this.status('Click a cell of the glowing grid to place a note · drag to aim · wheel moves through the song · right-drag turns the camera');
         this.rebuildPreview();
         this.updateTime();
     }
 
     layout() {
         if (!this.active) return;
-        this.timeline.layout();
-        const pv = $('ed-preview');
-        this.engine.setViewBox(pv && pv.offsetParent ? pv.getBoundingClientRect() : null);
-        this.timeline.invalidate();
+        this.view.layout();
+        this.overview.layout();
     }
 
-    focusTimeline() {
+    // the 3D view and the song strip both show the map
+    invalidateView() {
+        if (this.view) this.view.invalidate();
+        if (this.overview) this.overview.invalidate();
+    }
+
+    snapBeat(b) { const s = this.snap; return Math.round(b * s) / s; }
+
+    // edit = the 3D editor · game = the map exactly as the game draws it
+    setViewMode(mode) {
+        this.viewMode = mode === 'game' ? 'game' : 'edit';
+        this.view.setMode(this.viewMode);
+        const bar = $('ed-viewbar');
+        if (bar) {
+            bar.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === this.viewMode));
+            bar.querySelector('.ed-cams').classList.toggle('hidden', this.viewMode !== 'edit');
+        }
+        const hint = $('ed-viewhint');
+        if (hint) hint.textContent = this.viewMode === 'edit'
+            ? 'Click the grid: place · drag: aim · right-click: delete · right-drag: turn camera · middle-drag: pan · wheel: move in time'
+            : 'Game view — what the player sees. Space plays, the wheel moves in time. Press G to edit again.';
+    }
+
+    setSpacing(v) {
+        this.spacing = Math.max(0.4, Math.min(8, Math.round(v * 100) / 100));
+        const r = $('ed-spacing');
+        if (r) r.value = String(this.spacing);
+        if (this.view) { this.view.invalidate(); }
+        if (this.overview) this.overview.invalidate();
+        this.scheduleSave();
+    }
+
+    focusView() {
         if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     }
 
@@ -610,10 +661,10 @@ export class Editor {
         $('ed-play').onclick = () => this.togglePlay();
         const snapSel = $('ed-snap');
         snapSel.value = String(this.snap);
-        snapSel.onchange = () => { this.snap = Number(snapSel.value); this.timeline.invalidate(); this.focusTimeline(); };
+        snapSel.onchange = () => { this.snap = Number(snapSel.value); this.view.refresh(); this.focusView(); };
         const rate = $('ed-rate');
         rate.value = String(this.playRate);
-        rate.onchange = () => { this.playRate = Number(rate.value); if (this.playing) audio.setRate(this.playRate); this.focusTimeline(); };
+        rate.onchange = () => { this.playRate = Number(rate.value); if (this.playing) audio.setRate(this.playRate); this.focusView(); };
         const hits = $('ed-hits'), metro = $('ed-metro');
         hits.classList.toggle('on', this.hitsounds);
         metro.classList.toggle('on', this.metronome);
@@ -626,9 +677,18 @@ export class Editor {
         $('ed-export').onclick = () => this.exportZip(this.project, this.files);
         $('ed-help').onclick = () => this.showHelp();
         $('ed-tabs').querySelectorAll('[data-tab]').forEach(b => { b.onclick = () => this.setPanel(b.dataset.tab); });
+        const bar = $('ed-viewbar');
+        bar.querySelectorAll('[data-mode]').forEach(b => { b.onclick = () => { this.setViewMode(b.dataset.mode); this.focusView(); }; });
+        bar.querySelectorAll('[data-cam]').forEach(b => { b.onclick = () => { this.view.preset(b.dataset.cam); this.focusView(); }; });
+        const sp = $('ed-spacing');
+        sp.value = String(this.spacing);
+        sp.oninput = () => this.setSpacing(Number(sp.value));
+        sp.onchange = () => this.focusView();
 
         const menu = $('ed-tools-menu');
         const items = [
+            ['Game view / edit view', 'G', () => this.setViewMode(this.viewMode === 'edit' ? 'game' : 'edit')],
+            ['Reset the camera', 'R', () => this.view.preset('edit')],
             ['Mirror selection', 'M', () => this.mirror()],
             ['Swap colours of selection', 'N', () => this.flipColors()],
             ['Snap selection to grid', '', () => this.quantize()],
@@ -653,8 +713,10 @@ export class Editor {
         const toolBtn = (k, label, key, extra = '') => `<button class="ed-tool ${this.tool === k ? 'active' : ''} ${extra}" data-tool="${k}" title="${label} (${key})"><span class="ed-tool-ico ${k}"></span>${label}<kbd>${key}</kbd></button>`;
         box.innerHTML = `
             <div class="ed-group"><div class="ed-group-title">Place</div>
-                ${toolBtn('red', 'Red note', '1')}${toolBtn('blue', 'Blue note', '2')}${toolBtn('bomb', 'Bomb', '3')}${toolBtn('select', 'Select', 'V')}
-                <div class="ed-tip">Walls and lights: just click in their columns.</div>
+                ${toolBtn('red', 'Red note', '1')}${toolBtn('blue', 'Blue note', '2')}${toolBtn('bomb', 'Bomb', '3')}${toolBtn('wall', 'Wall', '4')}${toolBtn('select', 'Select', 'V')}
+                <div class="ed-tip">${this.tool === 'wall' ? 'Drag along the track to draw a wall; a click makes a one-beat wall.'
+                    : this.tool === 'select' ? 'Drag a box to select. Click anything to inspect it.'
+                    : 'Click a cell of the glowing grid. Lights: click the lanes on the right of the track.'}</div>
             </div>
             <div class="ed-group"><div class="ed-group-title">Direction</div>
                 <div class="ed-dirpad">${DIR_PAD.map(d => `<button class="ed-dir ${this.dir === d ? 'active' : ''}" data-dir="${d}" title="${M.DIR_NAMES[d]}">${ARROWS[d]}</button>`).join('')}</div>
@@ -686,10 +748,10 @@ export class Editor {
         const ccOn = $('ed-cc-on'), cc = $('ed-cc');
         const upd = () => { this.customColor = ccOn.checked ? hexToRgb(cc.value) : null; };
         ccOn.onchange = upd; cc.oninput = () => { ccOn.checked = true; upd(); };
-        box.querySelectorAll('input[type="range"], input[type="checkbox"]').forEach(i => i.addEventListener('change', () => this.focusTimeline()));
+        box.querySelectorAll('input[type="range"], input[type="checkbox"]').forEach(i => i.addEventListener('change', () => this.focusView()));
     }
 
-    setTool(t) { this.tool = t; this.renderTools(); this.timeline.invalidate(); }
+    setTool(t) { this.tool = t; this.renderTools(); this.view.refresh(); }
 
     setDir(d) {
         // with notes selected, a direction re-aims them (like ChroMapper)
@@ -730,7 +792,7 @@ export class Editor {
     afterChange(label = '') {
         this._clock = null;
         for (const o of this.sel) if (!this.data[kindOf(o)].includes(o)) this.sel.delete(o);
-        this.timeline.invalidate();
+        this.invalidateView();
         this.schedulePreview();
         this.scheduleSave();
         this.refreshPanel();
@@ -752,7 +814,7 @@ export class Editor {
     }
 
     placeNote(lane, layer, beat, dirOverride = null) {
-        if (this.tool === 'select') return;
+        if (this.tool === 'select' || this.tool === 'wall') return;
         if (beat < 0) return;
         if (this.tool === 'bomb') {
             this.edit('Placed a bomb', (D) => {
@@ -803,39 +865,41 @@ export class Editor {
             if (i >= 0) list.splice(i, 1);
             this.sel.delete(o);
         }
-        this.timeline.invalidate();
+        this.invalidateView();
     }
     commitErase() { this._erasing = false; this.afterChange('Deleted'); }
 
     select(list, add = false) {
         if (!add) this.sel.clear();
         for (const o of list) this.sel.add(o);
-        this.timeline.invalidate();
+        this.view.refresh();
         this.refreshPanel();
-        if (list.length) this.status(`${this.sel.size} selected · arrows / Alt+wheel move · M mirror · Del delete · Ctrl+C copy`);
+        if (list.length) this.status(`${this.sel.size} selected · drag to move · ← → ↑ ↓ (with Alt: in time) · M mirror · Del delete · Ctrl+C copy`);
     }
-    toggleSelect(o) { if (this.sel.has(o)) this.sel.delete(o); else this.sel.add(o); this.timeline.invalidate(); this.refreshPanel(); }
+    toggleSelect(o) { if (this.sel.has(o)) this.sel.delete(o); else this.sel.add(o); this.view.refresh(); this.refreshPanel(); }
     selectAll() {
         const D = this.data;
         this.select([...D.notes, ...D.bombs, ...D.walls, ...D.events, ...D.arcs, ...D.chains]);
     }
 
-    moveSelection(dBeat, dLane) {
+    moveSelection(dBeat, dLane, dLayer = 0) {
         if (!this.sel.size) return;
         this.edit('Moved', () => {
             for (const o of this.sel) {
                 const k = kindOf(o);
                 o.b = Math.max(0, Math.round((o.b + dBeat) * 10000) / 10000);
                 if ('tb' in o) o.tb = Math.max(0, Math.round((o.tb + dBeat) * 10000) / 10000);
-                if (!dLane || k === 'events') continue;
-                if (k === 'walls') o.x = Math.max(0, Math.min(4 - Math.max(1, o.w), o.x + dLane));
-                else {
-                    o.x = Math.max(0, Math.min(3, o.x + dLane));
-                    if ('tx' in o) o.tx = Math.max(0, Math.min(3, o.tx + dLane));
-                }
+                if ((!dLane && !dLayer) || k === 'events') continue;
+                if (k === 'walls') { o.x = Math.max(0, Math.min(4 - Math.max(1, o.w), o.x + dLane)); continue; }
+                o.x = Math.max(0, Math.min(3, o.x + dLane));
+                o.y = Math.max(0, Math.min(2, o.y + dLayer));
+                if ('tx' in o) { o.tx = Math.max(0, Math.min(3, o.tx + dLane)); o.ty = Math.max(0, Math.min(2, o.ty + dLayer)); }
             }
         });
     }
+
+    // a drag in the 3D view changes objects live; this is its undo step
+    recordUndo(label) { this.history.record(this.diffIndex, this.data, label); }
 
     deleteSelection() {
         if (!this.sel.size) return;
@@ -858,7 +922,7 @@ export class Editor {
 
     paste() {
         if (!this.clipboard || !this.clipboard.length) return;
-        const at = this.timeline.snap(this.cursorBeat);
+        const at = this.placeBeat;
         const added = [];
         this.edit(`Pasted ${this.clipboard.length}`, (D) => {
             for (const { kind, o } of this.clipboard) {
@@ -889,8 +953,8 @@ export class Editor {
         if (!this.sel.size) return;
         this.edit('Snapped to grid', () => {
             for (const o of this.sel) {
-                o.b = this.timeline.snap(o.b);
-                if ('tb' in o) o.tb = this.timeline.snap(o.tb);
+                o.b = this.snapBeat(o.b);
+                if ('tb' in o) o.tb = this.snapBeat(o.tb);
             }
         });
     }
@@ -928,12 +992,12 @@ export class Editor {
     addBookmark() {
         const name = prompt('Bookmark name', `Part ${this.data.bookmarks.length + 1}`);
         if (name == null) return;
-        const b = this.timeline.snap(this.cursorBeat);
+        const b = this.placeBeat;
         this.edit('Added a bookmark', (D) => { D.bookmarks.push({ b, name: name.slice(0, 40) }); D.bookmarks.sort((a, c) => a.b - c.b); });
     }
 
     addBpmChange() {
-        const b = this.timeline.snap(this.cursorBeat);
+        const b = this.placeBeat;
         const cur = this.clock.bpmAt(b);
         const v = Number(prompt(`New BPM from beat ${b}`, String(cur)));
         if (!(v > 0)) return;
@@ -958,11 +1022,11 @@ export class Editor {
             const gen = M.autoLights(this.diff);
             D.events = keep ? [...D.events, ...gen] : gen;
         });
-        toast('Light show added — tweak it on the timeline');
+        toast('Light show added — tweak it in the light lanes');
     }
 
     showStrobe() {
-        const from = this.timeline.snap(this.cursorBeat);
+        const from = this.placeBeat;
         const bd = this.modal(`<h2>Strobe generator</h2>
             <div class="sub">Alternating light events on a lane.</div>
             <div class="ed-form">
@@ -1013,21 +1077,21 @@ export class Editor {
         this.sel.clear();
         this._clock = null;
         this.refreshDiffSelect();
-        this.timeline.invalidate();
+        this.invalidateView();
         this.rebuildPreview();
         this.refreshPanel();
         this.scheduleSave();
     }
 
     // =====================================================================
-    // Cursor, zoom, playback
+    // Cursor, playback
     // =====================================================================
     setCursor(beat) {
         const b = Math.max(0, Math.min(this.endBeat, beat));
         this.cursorBeat = b;
         if (this.playing && this.gp) { this.gp.seek(this.cursorSec); audio.setRate(this.playRate); }
         else this._pendingSeek = true;
-        this.timeline.invalidate();
+        if (this.view) this.view.refresh();
         this.updateTime();
         if (this.panel === 'grid') this.refreshPanel();
     }
@@ -1038,7 +1102,9 @@ export class Editor {
         this.setCursor(base + n / s);
     }
 
-    setZoom(z) { this.zoom = Math.max(20, Math.min(900, z)); this.timeline.invalidate(); }
+    // where new notes go: the cursor itself (it sits on the snap grid unless you
+    // jumped to an off-grid object, and then that moment is what you want)
+    get placeBeat() { return Math.round(this.cursorBeat * 10000) / 10000; }
 
     updateTime() {
         const el = $('ed-time');
@@ -1067,9 +1133,7 @@ export class Editor {
         this.holdPreview();
         const b = $('ed-play');
         if (b) { b.textContent = '▶'; b.classList.remove('on'); }
-        this.timeline.invalidate();
-        this.updateTime();
-        if (this.panel === 'grid') this.refreshPanel();
+        this.setCursor(this.snapBeat(this.cursorBeat));     // land on the grid, ready to place
     }
 
     onSongEnd() {
@@ -1078,7 +1142,7 @@ export class Editor {
     }
 
     // per frame, from the main loop
-    update() {
+    update(dt = 0.016) {
         if (!this.active) return;
         if (this.playing && this.gp) {
             const sec = audio.songTime - (this.gp.latency || 0);
@@ -1090,7 +1154,6 @@ export class Editor {
             }
             this._lastBeat = beat;
             this.cursorBeat = Math.max(0, beat);
-            this.timeline.invalidate();
             const now = performance.now();
             if (now - (this._lastTimeUi || 0) > 60) { this._lastTimeUi = now; this.updateTime(); }
         } else if (this._pendingSeek && this.gp) {
@@ -1098,11 +1161,13 @@ export class Editor {
             this.gp.seek(this.cursorSec);
         }
         if (this._previewAt && performance.now() >= this._previewAt) this.rebuildPreview();
-        this.timeline.render();
+        this.view.render(dt);
+        this.overview.render();
     }
 
     // =====================================================================
-    // 3D preview (the game itself, in preview mode)
+    // The game itself, in preview mode: it runs the lights and environment
+    // behind the 3D editor, and is what Game view shows
     // =====================================================================
     schedulePreview() { this._previewAt = performance.now() + (this.playing ? 400 : 120); }
 
@@ -1126,6 +1191,7 @@ export class Editor {
             });
             this.gp = gp;
             this.engine.gameplay = gp;
+            gp.hideObjects = this.viewMode !== 'game';
             $('hud').classList.add('hidden');
             if (was) { gp.seek(sec); audio.setRate(this.playRate); }
             else { this.holdPreview(); gp.seek(sec); }
@@ -1171,7 +1237,7 @@ export class Editor {
         const p = this.project;
         if (!p) return;
         p.updated = Date.now();
-        p.editor = { diff: this.diffIndex, cursor: this.cursorBeat, snap: this.snap, zoom: this.zoom };
+        p.editor = { diff: this.diffIndex, cursor: this.cursorBeat, snap: this.snap, spacing: this.spacing };
         await store.put(p);
         if (publish) await saveLibraryRecord(await this.buildRecord(p, this.files));
         const el = $('ed-saved');
@@ -1335,7 +1401,7 @@ export class Editor {
 
     // the 4×3 grid at the cursor, as the player sees it
     renderGrid(box) {
-        const b = this.timeline.snap(this.cursorBeat);
+        const b = this.placeBeat;
         const D = this.data;
         const at = (list) => list.filter(o => Math.abs(o.b - b) < 1e-4);
         const notes = at(D.notes), bombs = at(D.bombs);
@@ -1349,7 +1415,7 @@ export class Editor {
         }
         box.innerHTML = `<div class="ed-insp-title">Grid at beat ${b}</div>
             <div class="ed-grid">${cells}</div>
-            <div class="ed-tip">Click to place the current tool here, drag inside a cell to aim, right-click to remove. Scroll the timeline to move in time.</div>`;
+            <div class="ed-tip">The same grid as the glowing frame in the 3D view: click to place, drag inside a cell to aim, right-click to remove. Scroll to move in time.</div>`;
         box.querySelectorAll('.ed-gcell').forEach(c => {
             let start = null;
             c.addEventListener('contextmenu', (e) => {
@@ -1364,7 +1430,7 @@ export class Editor {
                 const dx = e.clientX - start.x, dy = e.clientY - start.y;
                 start = null;
                 const dir = Math.hypot(dx, dy) > 10 ? dirFromDrag(dx, dy) : null;
-                if (this.tool === 'select') this.setTool('red');
+                if (this.tool === 'select' || this.tool === 'wall') this.setTool('red');
                 this.placeNote(Number(c.dataset.x), Number(c.dataset.y), b, dir);
             });
         });
@@ -1477,7 +1543,7 @@ export class Editor {
     switchDiffForce() {
         this.sel.clear();
         this._clock = null;
-        this.timeline.invalidate();
+        this.invalidateView();
         this.rebuildPreview();
         this.refreshPanel();
         this.scheduleSave();
@@ -1548,18 +1614,27 @@ export class Editor {
     showHelp() {
         this.modal(`<h2>Shortcuts</h2>
             <div class="rb-keys ed-keys">
-                <div><b>Click</b><span>place (notes / walls / lights by column)</span></div>
-                <div><b>Drag while placing</b><span>aim the note / size the wall</span></div>
-                <div><b>Right-click / drag</b><span>delete</span></div>
+                <div><b>Click the glowing grid</b><span>place a note / bomb at the cursor</span></div>
+                <div><b>Drag while placing</b><span>aim the note</span></div>
+                <div><b>Click the track ahead</b><span>move the cursor there (or scroll the wheel)</span></div>
+                <div><b>Wall tool (4)</b><span>drag along the track to draw a wall</span></div>
+                <div><b>Light lanes</b><span>click the lanes right of the track</span></div>
+                <div><b>Right-click / drag</b><span>delete (right-drag on empty space turns the camera)</span></div>
+                <div><b>Middle-drag</b> · <b>Shift+right-drag</b><span>pan the camera</span></div>
+                <div><b>Right button + wheel</b><span>camera closer / further</span></div>
+                <div><b>Alt+drag</b><span>turn the camera (trackpads)</span></div>
+                <div><b>R</b> · <b>G</b><span>reset camera · game view</span></div>
                 <div><b>Shift-drag</b><span>box select (Ctrl-click adds)</span></div>
-                <div><b>Drag selection</b><span>move in time and lanes</span></div>
+                <div><b>Drag a note</b><span>move it to another lane / row (Alt: in time)</span></div>
+                <div><b>Drag a wall / light</b><span>move it in time</span></div>
+                <div><b>Double-click</b><span>jump the cursor to an object</span></div>
                 <div><b>Wheel</b> / <b>↑ ↓</b><span>move in time (Shift: 4×)</span></div>
-                <div><b>Ctrl+wheel</b> / <b>− =</b><span>zoom</span></div>
+                <div><b>Ctrl+wheel</b> / <b>− =</b><span>track spacing</span></div>
                 <div><b>[ ]</b><span>snap finer / coarser</span></div>
                 <div><b>Space</b><span>play / pause</span></div>
-                <div><b>1 2 3 V</b><span>red / blue / bomb / select</span></div>
+                <div><b>1 2 3 4 V</b><span>red / blue / bomb / wall / select</span></div>
                 <div><b>W A S D Q E Z C</b> · <b>F</b><span>aim up / left / down / right / diagonals · dot (numpad too)</span></div>
-                <div><b>← →</b><span>move selection across lanes</span></div>
+                <div><b>← →</b> · <b>Ctrl+↑ ↓</b><span>move selection across lanes · rows</span></div>
                 <div><b>Alt+↑ ↓</b><span>move selection in time</span></div>
                 <div><b>Ctrl+C X V</b><span>copy / cut / paste at the cursor</span></div>
                 <div><b>Ctrl+Z / Ctrl+Y</b><span>undo / redo</span></div>
@@ -1597,6 +1672,7 @@ export class Editor {
             else if (low === 'v') this.paste();
             else if (low === 'a') this.selectAll();
             else if (low === 's') { this.saveNow(true).then(() => toast('Saved — it\'s in your song list')); }
+            else if ((k === 'ArrowUp' || k === 'ArrowDown') && this.sel.size) this.moveSelection(0, 0, k === 'ArrowUp' ? 1 : -1);
             else handled = false;
         } else if (NUMPAD_DIRS[e.code] != null) this.setDir(NUMPAD_DIRS[e.code]);
         else switch (low) {
@@ -1614,6 +1690,7 @@ export class Editor {
             case '1': this.setTool('red'); break;
             case '2': this.setTool('blue'); break;
             case '3': this.setTool('bomb'); break;
+            case '4': this.setTool('wall'); break;
             case 'v': this.setTool('select'); break;
             case 'm': this.mirror(); break;
             case 'n': this.flipColors(); break;
@@ -1621,8 +1698,10 @@ export class Editor {
             case 't': this.testPlay(true); break;
             case '[': this.changeSnap(-1); break;
             case ']': this.changeSnap(1); break;
-            case '-': this.setZoom(this.zoom / 1.2); break;
-            case '=': case '+': this.setZoom(this.zoom * 1.2); break;
+            case '-': this.setSpacing(this.spacing / 1.2); break;
+            case '=': case '+': this.setSpacing(this.spacing * 1.2); break;
+            case 'g': this.setViewMode(this.viewMode === 'edit' ? 'game' : 'edit'); break;
+            case 'r': this.view.preset('edit'); break;
             case '?': this.showHelp(); break;
             default:
                 if (KEY_DIRS[low] != null) this.setDir(KEY_DIRS[low]);
@@ -1637,7 +1716,7 @@ export class Editor {
         const s = $('ed-snap');
         if (s) s.value = String(this.snap);
         this.status(`Snap 1/${this.snap} beat`);
-        this.timeline.invalidate();
+        this.view.refresh();
     }
 }
 
