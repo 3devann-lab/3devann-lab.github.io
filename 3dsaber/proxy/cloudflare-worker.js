@@ -4,7 +4,7 @@
 // CORS header so the game can use player search, scores and leaderboards.
 // It only proxies GET requests to the BeatLeader API — nothing else.
 
-const UPSTREAM = 'https://api.beatleader.xyz';
+const UPSTREAM = 'https://api.beatleader.com';
 // Lock this down to your site, e.g. 'https://evanblokender.org'. '*' works anywhere.
 const ALLOW_ORIGIN = '*';
 
