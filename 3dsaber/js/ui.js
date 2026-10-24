@@ -87,14 +87,16 @@ export function settingBuilders(body, onChange = () => {}) {
             return row;
         },
         choice(key, title, sub, options) {
+            const cur = s.get(key);
             const row = add(`${label(title, sub)}
-                <div class="setting-control seg">${options.map(([v, l]) =>
-                    `<button class="sort-btn ${s.get(key) === v ? 'active' : ''}" data-v="${esc(v)}">${esc(l)}</button>`).join('')}</div>`);
-            row.querySelectorAll('[data-v]').forEach(btn => {
+                <div class="setting-control seg">${options.map(([v, l], i) =>
+                    `<button class="sort-btn ${cur === v || String(cur) === String(v) ? 'active' : ''}" data-i="${i}">${esc(l)}</button>`).join('')}</div>`);
+            row.querySelectorAll('[data-i]').forEach(btn => {
                 btn.onclick = () => {
-                    s.set(key, btn.dataset.v);
-                    row.querySelectorAll('[data-v]').forEach(x => x.classList.toggle('active', x === btn));
-                    onChange(key, btn.dataset.v);
+                    const v = options[Number(btn.dataset.i)][0];     // keeps numbers as numbers
+                    s.set(key, v);
+                    row.querySelectorAll('[data-i]').forEach(x => x.classList.toggle('active', x === btn));
+                    onChange(key, v);
                 };
             });
             return row;
@@ -147,6 +149,60 @@ export const REPLAY_VIEW_ROWS = [
     ['slider', 'trailLength', 'Saber Trails', 'Trail length (also used when you play)', 0, 0.4, 0.01, fmt.ms],
     ['toggle', 'replayShowMisses', 'Mistakes on Timeline', 'Marks where notes were missed or bombs hit'],
     ['toggle', 'replaySkipIntro', 'Skip Intro', 'Start a moment before the first note'],
+];
+
+export const CONTROL_ROWS = [
+    ['slider', 'saberReachX', 'Horizontal Reach', 'How far sideways a full push moves the saber (lanes are 0.6 m apart)', 0.6, 2, 0.05, fmt.m],
+    ['slider', 'saberReachY', 'Vertical Reach', 'How far up/down a full push moves the saber (rows are 0.55 m apart)', 0.4, 1.4, 0.05, fmt.m],
+    ['slider', 'saberRestHeight', 'Rest Height', 'Where the saber cuts with the stick centred (1.40 m = middle row)', 0.8, 2, 0.05, fmt.m],
+    ['slider', 'saberRestSpread', 'Rest Spread', 'How far apart the sabers rest (0.30 m = each on its inner lane)', 0, 0.9, 0.05, fmt.m],
+    ['toggle', 'stickSquare', 'Reach Corners', 'Diagonals reach the grid corners (a round stick only gets 71% of the way)'],
+    ['slider', 'stickDeadzone', 'Deadzone', 'Ignore small stick drift (round, so diagonals stay smooth)', 0, 0.4, 0.01, fmt.pct],
+    ['slider', 'stickRange', 'Full Tilt At', 'How far you push for the edge of the reach (lower = less thumb travel)', 0.6, 1, 0.01, fmt.pct],
+    ['slider', 'stickCurve', 'Response Curve', '1.00 = linear · higher = finer control near centre, faster at the edge', 0.5, 2.5, 0.05, (v) => v.toFixed(2)],
+    ['slider', 'saberSmoothing', 'Saber Smoothing', 'Steadies the saber; 0 = follows the stick instantly', 0, 0.08, 0.002, (v) => (v < 0.001 ? 'Off' : Math.round(v * 1000) + ' ms')],
+    ['slider', 'saberTilt', 'Blade Tilt', 'How far the blade leans toward the notes', 0, 60, 1, fmt.deg],
+    ['toggle', 'swapSticks', 'Swap Sticks', 'Left stick moves the right (blue) saber and vice versa'],
+    ['toggle', 'invertY', 'Invert Vertical', 'Push up to move the saber down'],
+    ['slider', 'aimAssist', 'Aim Assist', 'Sabers drift toward matching notes (0 = off)', 0, 1, 0.1, fmt.pct],
+    ['slider', 'rumble', 'Vibration', 'Controller rumble strength', 0, 1, 0.05, (v) => (v < 0.01 ? 'Off' : fmt.pct(v))],
+];
+
+export const MOD_ROWS = [
+    ['choice', 'modSpeed', 'Song Speed', 'Slower is great for practice (no high score below 1x)', [[0.5, '0.5x'], [0.75, '0.75x'], [1, '1x'], [1.25, '1.25x'], [1.5, '1.5x'], [2, '2x']]],
+    ['toggle', 'noFail', 'No Fail', 'Never fail a song'],
+    ['toggle', 'modInstantFail', 'Instant Fail', 'One mistake ends the song'],
+    ['toggle', 'modStrict', 'Strict Angles', 'Cutting against the arrow is a bad cut'],
+    ['toggle', 'modNoArrows', 'No Arrows', 'Every note can be cut any way'],
+    ['toggle', 'modGhost', 'Ghost Notes', 'Only the arrows are visible'],
+    ['toggle', 'modDisappear', 'Disappearing Arrows', 'Arrows vanish before the note arrives'],
+    ['toggle', 'modSmallNotes', 'Small Notes', 'Notes look smaller (same hit area)'],
+    ['toggle', 'modNoBombs', 'No Bombs', ''],
+    ['toggle', 'modNoWalls', 'No Walls', ''],
+];
+
+export const SOUND_ROWS = [
+    ['slider', 'musicVolume', 'Music Volume', 'Song playback level', 0, 1, 0.05, fmt.pct],
+    ['slider', 'sfxVolume', 'Effects Volume', 'Hit sounds and UI', 0, 1, 0.05, fmt.pct],
+    ['choice', 'hitSound', 'Hit Sound', '', [['soft', 'Soft'], ['classic', 'Classic'], ['off', 'Off']]],
+    ['toggle', 'missSound', 'Miss Sound', 'Sound for misses, bad cuts and bombs'],
+    ['slider', 'audioOffset', 'Audio Offset', 'Notes reach you late vs the music? Lower it. Early (common with Bluetooth)? Raise it.', -300, 300, 5, (v) => (v > 0 ? '+' : '') + Math.round(v) + ' ms'],
+];
+
+export const LOOK_ROWS = [
+    ['slider', 'noteSize', 'Note Size', 'Bigger notes are easier to read (same hit area)', 0.6, 1.4, 0.05, fmt.x],
+    ['choice', 'judgeStyle', 'Hit Text', 'What pops up when you cut', [['words', 'PERFECT'], ['numbers', '115'], ['off', 'Off']]],
+    ['slider', 'hitParticles', 'Hit Sparks', 'Amount of sparks per cut', 0, 2, 0.1, (v) => (v < 0.05 ? 'Off' : fmt.x(v))],
+    ['toggle', 'cutHalves', 'Cut Halves', 'Cut notes split into two flying halves'],
+    ['slider', 'lightBrightness', 'Light Brightness', 'How bright the map\'s light show is', 0.2, 1.6, 0.05, fmt.pct],
+    ['toggle', 'reduceFlashing', 'Reduce Flashing', 'No strobes or flashes — lights fade smoothly (photosensitivity)'],
+];
+
+export const HUD_ROWS = [
+    ['slider', 'hudScale', 'HUD Size', '', 0.6, 1.4, 0.05, fmt.pct],
+    ['slider', 'hudOpacity', 'HUD Opacity', '', 0.2, 1, 0.05, fmt.pct],
+    ['toggle', 'hudTimer', 'Song Timer', 'Elapsed / total time under the song name'],
+    ['toggle', 'showFps', 'FPS Counter', 'Frames per second in the corner'],
 ];
 
 export const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];

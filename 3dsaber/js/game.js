@@ -9,7 +9,7 @@ import { DIR_VECTORS, reactionTime } from './beatmap.js';
 import { TrackSystem, UNIT, setUnityRotation, unityQuat, makeFx } from './noodle.js';
 import { NOTE_EVENT, FRAME_STRIDE, splitNoteId, cutParts, maxCutScore } from './bsor.js';
 import { audio } from './audio.js';
-import { gamepad } from './input.js';
+import { gamepad, shapeStick } from './input.js';
 import { settings } from './settings.js';
 
 // ---------- World constants ----------
@@ -27,8 +27,10 @@ const LAYER_STEP = 0.55;
 const WALL_STEP = UNIT;
 const SPAWN_LEAD_Y = 0.35;
 const SABER_Z = 0.25;           // saber plane in front of the hit point (normal play)
+const FANCY_WALLS = 160;        // walls drawn with the distortion effect at once (the rest use the light look)
 const CAM_MODES = ['first', 'third', 'follow', 'free'];
 const BLADE_LEN = 1.05;
+const CUT_AT = 0.6;             // metres up the saber (from the hilt) that the stick places on the note grid
 const DEG = Math.PI / 180;
 const AXIS_Z = new THREE.Vector3(0, 0, 1);
 const UP = new THREE.Vector3(0, 1, 0);
@@ -125,24 +127,64 @@ function makeDotTexture() {
 }
 
 // ---------- Wall distortion shader (real-time energy-field look) ----------
+// Walls are drawn in two instanced batches (one draw call each, however many
+// walls a wall-art map puts on screen). Colour and dissolve are per instance;
+// the glowing edges are drawn by the shader instead of separate line meshes.
 const WALL_VERT = /* glsl */`
+attribute float aAlpha;
 varying vec3 vWorldPos;
 varying vec3 vNormal;
+varying vec3 vLocal;
+varying vec3 vScale;
+varying vec3 vColor;
+varying float vAlpha;
 void main() {
-    vec4 wp = modelMatrix * vec4(position, 1.0);
+    mat4 m = modelMatrix * instanceMatrix;
+    vec4 wp = m * vec4(position, 1.0);
     vWorldPos = wp.xyz;
-    vNormal = normalize(mat3(modelMatrix) * normal);
+    vNormal = normalize(mat3(m) * normal);
+    vLocal = position;
+    vScale = vec3(length(m[0].xyz), length(m[1].xyz), length(m[2].xyz));
+    vColor = instanceColor;
+    vAlpha = aAlpha;
     gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 
+// metres from this fragment to the nearest edge of the box face it lies on
+const WALL_EDGE = /* glsl */`
+float wallEdge() {
+    vec3 d = (0.5 - abs(vLocal)) * vScale;
+    float lo = min(d.x, min(d.y, d.z)), hi = max(d.x, max(d.y, d.z));
+    float mid = d.x + d.y + d.z - lo - hi;
+    float w = 0.014 + 0.004 * length(cameraPosition - vWorldPos) * 0.05;
+    return 1.0 - smoothstep(w * 0.5, w, mid);
+}`;
+
+// cheap look: additive glass + edges (wall art, or Wall Distortion off)
+const WALL_SIMPLE_FRAG = /* glsl */`
+varying vec3 vWorldPos;
+varying vec3 vNormal;
+varying vec3 vLocal;
+varying vec3 vScale;
+varying vec3 vColor;
+varying float vAlpha;
+${WALL_EDGE}
+void main() {
+    float e = wallEdge();
+    gl_FragColor = vec4(vColor, (0.16 + e * 0.6) * vAlpha);
+}`;
+
 const WALL_FRAG = /* glsl */`
-uniform vec3 uColor;
-uniform float uOpacity;
 uniform float uTime;
 uniform sampler2D uScene;
 uniform vec2 uResolution;
 varying vec3 vWorldPos;
 varying vec3 vNormal;
+varying vec3 vLocal;
+varying vec3 vScale;
+varying vec3 vColor;
+varying float vAlpha;
+${WALL_EDGE}
 
 float hash(vec3 p) {
     p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
@@ -169,8 +211,10 @@ void main() {
     vec2 warp = vec2(n1 - 0.5, n2 - 0.5) * (0.05 + fres * 0.035);
     vec3 refr = texture2D(uScene, clamp(suv + warp, vec2(0.002), vec2(0.998))).rgb;
     float swirl = 0.5 + 0.5 * sin(6.28318 * (n1 + n2 * 0.5) + uTime * 0.7);
-    vec3 col = refr * (0.82 + swirl * 0.12) + uColor * (0.10 + fres * 0.5 + swirl * 0.08);
-    float alpha = uOpacity * clamp(0.88 + fres * 0.12, 0.0, 1.0);
+    vec3 col = refr * (0.82 + swirl * 0.12) + vColor * (0.10 + fres * 0.5 + swirl * 0.08);
+    float e = wallEdge();
+    col = mix(col, vColor * 1.4, e * 0.75);
+    float alpha = vAlpha * clamp(0.88 + fres * 0.12, 0.0, 1.0);
     gl_FragColor = vec4(col, alpha);
 }`;
 
@@ -196,6 +240,10 @@ void main() {
 }`;
 
 // ---------- Light group (responds to beatmap lighting events) ----------
+// Settings → Lights: overall brightness, and "reduce flashing" (no strobes:
+// every change glides instead of snapping)
+const LIGHT_OPTS = { scale: 1, reduce: false };
+
 const BASE_BLUE = new THREE.Color(0x2d7dff);
 const BASE_RED = new THREE.Color(0xff2d55);
 const BASE_WHITE = new THREE.Color(0xffffff);
@@ -239,6 +287,12 @@ class LightGroup {
         else if (this.legacy) col.copy(this.legacy);
 
         const f = clamp(Number.isFinite(float) ? float : 1, 0, 1.6) * boost;
+        if (LIGHT_OPTS.reduce) {
+            if (mode !== 'off') this.color.copy(col);
+            this.target = mode === 'off' ? 0 : mode === 'fade' ? f * 0.4 : f;
+            this.decay = 1.2;
+            return;
+        }
         switch (mode) {
             case 'off':   this.level = 0; this.target = 0; this.decay = 0; break;
             case 'on':    this.color.copy(col); this.level = f; this.target = f; this.decay = 0; break;
@@ -263,7 +317,7 @@ class LightGroup {
             this.color.lerpColors(this.grad.start, this.grad.end, f);
             if (f >= 1) this.grad = null;
         }
-        const intensity = Math.min(4, this.level * this.base);
+        const intensity = Math.min(4, this.level * this.base * LIGHT_OPTS.scale);
         for (const m of this.materials) {
             m.emissive.copy(this.color);
             m.emissiveIntensity = intensity;
@@ -379,6 +433,93 @@ class SlicePool {
     clear() { for (const it of this.items) it.mesh.visible = false; }
 }
 
+// ---------- Instanced batches ----------
+// One draw call for every wall (or every animated environment piece sharing a
+// shape and material) instead of one or two per object. Objects keep a plain
+// Object3D for their transform; the batch copies world matrices each frame.
+const _camPos = new THREE.Vector3();
+
+class WallBatch {
+    constructor(scene, material) {
+        this.scene = scene;
+        this.material = material;
+        this.mesh = null;
+        this.cap = 0;
+        this.n = 0;
+        this.alloc(128);
+    }
+
+    alloc(cap) {
+        const old = this.mesh;
+        const geo = new THREE.BoxGeometry(1, 1, 1);
+        this.alpha = new THREE.InstancedBufferAttribute(new Float32Array(cap), 1).setUsage(THREE.DynamicDrawUsage);
+        geo.setAttribute('aAlpha', this.alpha);
+        const mesh = new THREE.InstancedMesh(geo, this.material, cap);
+        mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3).setUsage(THREE.DynamicDrawUsage);
+        mesh.frustumCulled = false;
+        mesh.count = 0;
+        mesh.visible = false;
+        this.scene.add(mesh);
+        if (old) { this.scene.remove(old); old.geometry.dispose(); old.dispose(); }
+        this.mesh = mesh;
+        this.cap = cap;
+    }
+
+    begin(maxCount) {
+        if (maxCount > this.cap) this.alloc(Math.max(this.cap * 2, 1 << Math.ceil(Math.log2(maxCount))));
+        this.n = 0;
+    }
+
+    push(matrix, color, alpha) {
+        const i = this.n++;
+        this.mesh.instanceMatrix.array.set(matrix.elements, i * 16);
+        const c = this.mesh.instanceColor.array;
+        c[i * 3] = color.r; c[i * 3 + 1] = color.g; c[i * 3 + 2] = color.b;
+        this.alpha.array[i] = alpha;
+    }
+
+    end() {
+        const m = this.mesh;
+        m.count = this.n;
+        m.visible = this.n > 0;
+        if (this.n) {
+            m.instanceMatrix.needsUpdate = true;
+            m.instanceColor.needsUpdate = true;
+            this.alpha.needsUpdate = true;
+        }
+    }
+
+    dispose() {
+        this.scene.remove(this.mesh);
+        this.mesh.geometry.dispose();
+        this.mesh.dispose();
+        this.material.dispose();
+    }
+}
+
+// Animated Chroma environment pieces (model maps can have thousands)
+class EnvBatch {
+    constructor(scene, geometry, material, proxies) {
+        this.proxies = proxies;
+        this.mesh = new THREE.InstancedMesh(geometry, material, proxies.length);
+        this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.mesh.frustumCulled = false;
+        scene.add(this.mesh);
+    }
+
+    update() {
+        const arr = this.mesh.instanceMatrix.array;
+        for (let i = 0; i < this.proxies.length; i++) arr.set(this.proxies[i].matrixWorld.elements, i * 16);
+        this.mesh.instanceMatrix.needsUpdate = true;
+    }
+
+    dispose() {
+        this.mesh.removeFromParent();
+        this.mesh.dispose();
+    }
+}
+
 // ---------- Engine ----------
 // msaa: samples on the post-processing target (High only — it's costly on
 // integrated/mobile GPUs); refrEvery: refresh the wall-refraction capture every
@@ -464,6 +605,8 @@ export class Engine {
 
         this.buildEnvironment();
         this.applySize();
+        this.applyVisualSettings();
+        this._fps = { frames: 0, acc: 0 };
 
         addEventListener('resize', () => this.applySize());
         const canvas = this.renderer.domElement;
@@ -486,10 +629,8 @@ export class Engine {
             noteFace: new THREE.PlaneGeometry(0.48 * 0.86, 0.48 * 0.86),
             chainFace: new THREE.PlaneGeometry(0.3 * 0.86, 0.3 * 0.86),
             bomb: new THREE.IcosahedronGeometry(0.22, 0),
-            wallBox: new THREE.BoxGeometry(1, 1, 1),
             head: new THREE.BoxGeometry(0.22, 0.12, 0.12),
         };
-        a.wallEdges = new THREE.EdgesGeometry(a.wallBox);
         a.arrowMat = new THREE.MeshBasicMaterial({ map: this.arrowTex, transparent: true, depthWrite: false });
         a.dotMat = new THREE.MeshBasicMaterial({ map: this.dotTex, transparent: true, depthWrite: false });
         a.bombMat = new THREE.MeshStandardMaterial({
@@ -506,6 +647,21 @@ export class Engine {
         this.camHomeQuat.setFromEuler(new THREE.Euler(-settings.num('camTilt', -45, 75) * DEG, 0, 0, 'YXZ'));
         if (this.gameplay) this.gameplay.onCameraSettings();
         else this.setFov(settings.num('camFov', 30, 140));
+    }
+
+    // lights, HUD and FPS options (Settings → Graphics / HUD)
+    applyVisualSettings() {
+        LIGHT_OPTS.scale = settings.num('lightBrightness', 0.1, 2);
+        LIGHT_OPTS.reduce = !!settings.get('reduceFlashing');
+        const hud = document.getElementById('hud');
+        if (hud) {
+            hud.style.setProperty('--hud-scale', String(settings.num('hudScale', 0.5, 1.6)));
+            hud.style.opacity = String(settings.num('hudOpacity', 0.15, 1));
+            hud.classList.toggle('no-timer', settings.get('hudTimer') === false);
+        }
+        this.showFps = !!settings.get('showFps');
+        const f = document.getElementById('fps');
+        if (f) f.classList.toggle('hidden', !this.showFps);
     }
 
     setFov(fov) {
@@ -544,7 +700,39 @@ export class Engine {
 
     // Dynamic resolution: drop render scale when frames run long, creep back up
     // when there's headroom (Auto quality only).
+    // Safety net at any quality setting: a run of very slow frames means the
+    // GPU is overloaded (the step before a driver reset can take the whole
+    // browser down), so shed the expensive effects for the rest of the level.
+    guardFrames(dt) {
+        const gp = this.gameplay;
+        if (!gp || gp.paused || this.lightMode || dt > 0.6 || settings.get('safeMode') === false) return;
+        const g = this._guard || (this._guard = { slow: 0 });
+        if (dt > 0.1) g.slow++;
+        else g.slow = Math.max(0, g.slow - 0.2);
+        if (g.slow >= 12) this.enterLightMode();
+    }
+
+    enterLightMode() {
+        if (this.lightMode) return;
+        this.lightMode = true;
+        this.bloom.enabled = false;
+        if (this.gameplay) this.gameplay.wallFancy = false;
+        this.renderScale = this.minScale;
+        this.applySize();
+        if (this.onLightMode) this.onLightMode();
+    }
+
+    leaveLightMode() {
+        if (this._guard) this._guard.slow = 0;
+        if (!this.lightMode) return;
+        this.lightMode = false;
+        this.bloom.enabled = settings.get('bloom') !== false;
+        this.renderScale = this.maxScale;
+        this.applySize();
+    }
+
     trackPerformance(dt) {
+        this.guardFrames(dt);
         if (!this.q.dynamic || dt > 0.2) return;
         const p = this._perf;
         p.acc += dt; p.frames++;
@@ -788,6 +976,15 @@ export class Engine {
         this.wallUniforms.uTime.value = now;
         if (this.contextLost) return dt;
         this.trackPerformance(rawDt);
+        if (this.showFps) {
+            const f = this._fps;
+            f.frames++; f.acc += rawDt;
+            if (f.acc >= 0.5) {
+                const el = document.getElementById('fps');
+                if (el) el.textContent = Math.round(f.frames / f.acc) + ' FPS' + (this.lightMode ? ' · light mode' : '');
+                f.frames = 0; f.acc = 0;
+            }
+        }
 
         if (this.gameplay) {
             // A broken frame (bad map data, etc.) must never freeze the render
@@ -818,19 +1015,13 @@ export class Engine {
         this.frame++;
         // Refraction pre-pass: capture the scene without distortion walls so
         // the wall shader can warp what's behind them (like the real game).
-        const gp = this.gameplay;
-        if (gp && gp.liveWalls.length && this.frame % this.q.refrEvery === 0) {
-            const hidden = this._hidden || (this._hidden = []);
-            hidden.length = 0;
-            for (const w of gp.liveWalls) {
-                if (w.userData.mat.isShaderMaterial && w.visible) { w.visible = false; hidden.push(w); }
-            }
-            if (hidden.length) {
-                this.renderer.setRenderTarget(this.refractionRT);
-                this.renderer.render(this.scene, this.camera);
-                this.renderer.setRenderTarget(null);
-                for (const w of hidden) w.visible = true;
-            }
+        const fancy = this.gameplay && this.gameplay.wallBatches && this.gameplay.wallBatches.fancy.mesh;
+        if (fancy && fancy.count > 0 && this.frame % this.q.refrEvery === 0) {
+            fancy.visible = false;
+            this.renderer.setRenderTarget(this.refractionRT);
+            this.renderer.render(this.scene, this.camera);
+            this.renderer.setRenderTarget(null);
+            fancy.visible = true;
         }
 
         if (this.useComposer) {
@@ -848,7 +1039,15 @@ export class Engine {
 }
 
 // ---------- Saber ----------
-const _segAB = new THREE.Vector3(), _segAP = new THREE.Vector3();
+const _segAB = new THREE.Vector3(), _segAP = new THREE.Vector3(), _segC = new THREE.Vector3();
+const _sweepA = new THREE.Vector3(), _sweepB = new THREE.Vector3();
+
+function segDistance(point, a, b) {
+    _segC.subVectors(b, a);
+    _segAP.subVectors(point, a);
+    const t = clamp(_segAP.dot(_segC) / (_segC.lengthSq() || 1), 0, 1);
+    return _segAP.copy(a).addScaledVector(_segC, t).distanceTo(point);
+}
 
 class Saber {
     constructor(parent, colorHex, homeX) {
@@ -893,6 +1092,10 @@ class Saber {
         this.base = new THREE.Vector3();
         this.prevTip = new THREE.Vector3();
         this.hasPrev = false;
+        this.lastBase = new THREE.Vector3();     // last frame's blade, for swept hits
+        this.lastTip = new THREE.Vector3();
+        this.hasSeg = false;
+        this.hasLast = false;
 
         // Trail: ring buffer of blade segments, limited by AGE (not frame
         // count) so it looks the same at 30 fps as at 144 fps
@@ -927,13 +1130,20 @@ class Saber {
     resetTrail() {
         this.trailCount = 0;
         this.hasPrev = false;
+        this.hasSeg = false;
+        this.hasLast = false;
     }
 
-    // stick: {x: -1..1, y: -1..1 (down positive)}
-    move(stick, dt) {
-        const targetX = this.homeX * 0.25 + stick.x * 1.45;
-        const targetY = 1.25 - stick.y * 1.0;
-        const k = 1 - Math.exp(-22 * dt);           // snappy, still smooth
+    /**
+     * The stick places the blade's cutting point (CUT_AT up the saber) on the
+     * note grid: centred stick = rest spot, full tilt = reach in that direction.
+     * stick: shaped input {x, y} in -1..1 (y down positive)
+     * ctl: {restX, restY, reachX, reachY, smooth (s), tilt (rad)}
+     */
+    move(stick, dt, ctl) {
+        const targetX = ctl.restX + stick.x * ctl.reachX;
+        const targetY = ctl.restY - stick.y * ctl.reachY;
+        const k = ctl.smooth > 0.001 ? 1 - Math.exp(-dt / ctl.smooth) : 1;
         const oldX = this.pos.x, oldY = this.pos.y;
         this.pos.x += (targetX - this.pos.x) * k;
         this.pos.y += (targetY - this.pos.y) * k;
@@ -943,11 +1153,13 @@ class Saber {
             this.smoothVel.lerp(this.vel, Math.min(1, dt * 18));
         }
 
-        this.group.position.set(this.pos.x, this.pos.y, SABER_Z);
-        // lean into the swing
+        // tilt forward, lean into the swing
         this.group.rotation.set(
-            -0.5 + clamp(this.smoothVel.y * 0.05, -0.5, 0.5), 0,
+            -ctl.tilt + clamp(this.smoothVel.y * 0.05, -0.5, 0.5), 0,
             clamp(-this.smoothVel.x * 0.06, -0.7, 0.7));
+        // hilt goes wherever puts the cutting point on the target, at the hit plane
+        _segAB.set(0, CUT_AT, 0).applyQuaternion(this.group.quaternion);
+        this.group.position.set(this.pos.x - _segAB.x, this.pos.y - _segAB.y, -_segAB.z);
     }
 
     // Replay: absolute pose in the hand rig's space
@@ -961,6 +1173,10 @@ class Saber {
     finalize(dt, trackVelocity = false) {
         this.group.updateWorldMatrix(true, false);
         const m = this.group.matrixWorld;
+        this.lastBase.copy(this.base);
+        this.lastTip.copy(this.tip);
+        this.hasLast = this.hasSeg;
+        this.hasSeg = true;
         this.base.set(0, 0.14, 0).applyMatrix4(m);
         this.tip.set(0, 0.14 + BLADE_LEN, 0).applyMatrix4(m);
         if (trackVelocity && dt > 0) {
@@ -1006,12 +1222,35 @@ class Saber {
         this.trailMesh.geometry.attributes.color.needsUpdate = true;
     }
 
-    // shortest distance from point to blade segment (world space, cached segment)
-    distanceTo(point) {
-        _segAB.subVectors(this.tip, this.base);
-        _segAP.subVectors(point, this.base);
-        const t = clamp(_segAP.dot(_segAB) / (_segAB.lengthSq() || 1), 0, 1);
-        return _segAP.copy(this.base).addScaledVector(_segAB, t).distanceTo(point);
+    // shortest distance from point to blade segment (world space, cached segment).
+    // swept: also check where the blade passed between last frame and this one,
+    // so a fast flick can't skip over a note between two frames.
+    distanceTo(point, swept = false) {
+        let best = segDistance(point, this.base, this.tip);
+        if (swept && this.hasLast) {
+            for (let i = 1; i <= 3; i++) {
+                const f = i / 4;
+                _sweepA.lerpVectors(this.lastBase, this.base, f);
+                _sweepB.lerpVectors(this.lastTip, this.tip, f);
+                best = Math.min(best, segDistance(point, _sweepA, _sweepB));
+            }
+            best = Math.min(best, segDistance(point, this.lastBase, this.lastTip));
+        }
+        return best;
+    }
+
+    // distance from point to where the blade was a fraction f of the way from
+    // last frame to this one (0 = last frame, 1 = now)
+    distanceAt(point, f) {
+        if (!this.hasLast || f >= 1) return segDistance(point, this.base, this.tip);
+        _sweepA.lerpVectors(this.lastBase, this.base, f);
+        _sweepB.lerpVectors(this.lastTip, this.tip, f);
+        return segDistance(point, _sweepA, _sweepB);
+    }
+
+    // the blade's cutting point in world space
+    cutPoint(out) {
+        return out.set(0, CUT_AT, 0).applyMatrix4(this.group.matrixWorld);
     }
 
     dispose() {
@@ -1085,6 +1324,24 @@ class ReplayPose {
     }
 }
 
+// short labels for the active modifiers (HUD corner)
+function modTags(m, noFail) {
+    const t = [];
+    if (noFail) t.push('NO FAIL');
+    const sp = Number(m.speed) || 1;
+    if (Math.abs(sp - 1) > 0.001) t.push(sp + 'x SPEED');
+    if (m.practiceStart > 0) t.push('PRACTICE');
+    if (m.noArrows) t.push('NO ARROWS');
+    if (m.ghost) t.push('GHOST');
+    if (m.disappear) t.push('DISAPPEARING');
+    if (m.noBombs) t.push('NO BOMBS');
+    if (m.noWalls) t.push('NO WALLS');
+    if (m.instantFail) t.push('INSTANT FAIL');
+    if (m.smallNotes) t.push('SMALL NOTES');
+    if (m.strict) t.push('STRICT');
+    return t;
+}
+
 // Free-camera starting points (orbit target is near the player's head)
 const FREE_PRESETS = {
     stage:  { tx: 0, ty: 1.2, tz: 0, yaw: 0.6, pitch: 0.25, dist: 4.5 },
@@ -1133,6 +1390,9 @@ export class Gameplay {
         this.songBuffer = songBuffer;
         this.opts = opts;
         this.replay = opts.replay || null;
+        // modifiers + practice start (normal play only): {speed, noArrows, ghost,
+        // disappear, noBombs, noWalls, instantFail, smallNotes, strict, practiceStart}
+        this.mods = this.replay ? {} : (opts.mods || {});
         this.v2 = mapData.version === 2;
 
         const speedMult = this.replay ? 1 : settings.get('noteSpeed');
@@ -1183,10 +1443,25 @@ export class Gameplay {
 
         this._matCache = new Map();
         this._ownMats = new Set();       // per-object materials to dispose with the session
+        // only objects on tracks that really animate colour / dissolve need their own material
+        this.fadeTracks = this.tracks.tracksAnimating(['color', 'dissolve', 'dissolveArrow']);
+        const wu = engine.wallUniforms;
+        this.wallFancy = settings.get('wallDistortion') !== false;
+        this.wallBatches = {
+            fancy: new WallBatch(this.scene, new THREE.ShaderMaterial({
+                uniforms: { uTime: wu.uTime, uScene: wu.uScene, uResolution: wu.uResolution },
+                vertexShader: WALL_VERT, fragmentShader: WALL_FRAG,
+                transparent: true, depthWrite: false, side: THREE.DoubleSide,
+            })),
+            plain: new WallBatch(this.scene, new THREE.ShaderMaterial({
+                vertexShader: WALL_VERT, fragmentShader: WALL_SIMPLE_FRAG,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+            })),
+        };
 
-        const mods = this.replay ? (this.replay.mods || []) : [];
-        const bombs = mods.includes('NB') ? [] : mapData.bombs;
-        const walls = mods.includes('NO') ? [] : mapData.walls;
+        const rmods = this.replay ? (this.replay.mods || []) : [];
+        const bombs = rmods.includes('NB') || this.mods.noBombs ? [] : mapData.bombs;
+        const walls = rmods.includes('NO') || this.mods.noWalls ? [] : mapData.walls;
 
         // Spawn queues sorted by SPAWN time (not hit time) so Noodle objects with
         // large spawn offsets appear exactly when they should, never late.
@@ -1199,6 +1474,7 @@ export class Gameplay {
 
         // Chroma environment geometry — the "custom models" in model maps
         this.spawnEnvironment(mapData.environment);
+        this.prewarm();
         if (mapData.environment && mapData.environment.hideGroups) engine.hideDecor(mapData.environment.hideGroups);
 
         this.noteIdx = 0; this.bombIdx = 0; this.wallIdx = 0; this.eventIdx = 0;
@@ -1216,17 +1492,21 @@ export class Gameplay {
         this.$ = (id) => document.getElementById(id);
         this._hud = {};
         this.$('hud-song-name').textContent = opts.songName || '';
-        this.$('hud-nofail-tag').classList.toggle('hidden', !this.noFail || !!this.replay);
+        const tags = this.replay ? [] : modTags(this.mods, this.noFail);
+        this.$('hud-nofail-tag').textContent = tags.join(' · ');
+        this.$('hud-nofail-tag').classList.toggle('hidden', !tags.length);
         const tag = this.$('hud-replay-tag');
         if (tag) {
             tag.classList.toggle('hidden', !this.replay);
             if (this.replay) tag.textContent = `REPLAY · ${this.replay.playerName || this.replay.data.info.playerName || 'Player'}`;
         }
         this.applyReplaySettings();
+        this.applyControlSettings();
+        this.applyPlaySettings();
         this.updateHud();
 
         let startAt = -2.2;
-        let rate = 1;
+        let rate = this.replay ? 1 : clamp(Number(this.mods.speed) || 1, 0.5, 2);
         this.playback = 1;           // replay viewer speed (on top of the replay's own modifiers)
         if (this.replay) {
             this.setupReplay();
@@ -1241,6 +1521,51 @@ export class Gameplay {
         }
         audio.onSongEnd = () => { if (!this.failed) this.finish(); };
         audio.startSong(songBuffer, startAt, rate);
+        // practice: jump in a couple of seconds before the chosen moment
+        if (!this.replay && this.mods.practiceStart > 0) this.seek(this.mods.practiceStart - 2.5);
+    }
+
+    // feel, look and sound options that apply to every level (Settings)
+    applyPlaySettings() {
+        const S = settings;
+        this.latency = S.num('audioOffset', -500, 500) / 1000;
+        this.vis = {
+            judge: S.get('judgeStyle') || 'words',
+            hitSound: S.get('hitSound') || 'soft',
+            missSound: S.get('missSound') !== false,
+            particles: S.num('hitParticles', 0, 2),
+            halves: S.get('cutHalves') !== false,
+        };
+        this.noteScale = S.num('noteSize', 0.5, 1.5) * (this.mods.smallNotes ? 0.6 : 1);
+        for (const g of this.liveNotes) g.userData.size = this.noteScale;
+        this.engine.applyVisualSettings();
+    }
+
+    playHitSound(strength) {
+        const st = this.vis.hitSound;
+        if (st === 'off') return;
+        if (st === 'classic' && audio.buffers.hit) audio.playSfx('hit', 0.75 * strength);
+        else audio.playHit(strength);
+    }
+
+    playMissSound(volume, rate = 1) {
+        if (this.vis.missSound) audio.playSfx('miss', volume, rate);
+    }
+
+    // Compile every shader the level needs now, behind the loading screen —
+    // compiling on first sight made the first wall / note / environment frame hitch.
+    prewarm() {
+        const A = this.engine.assets;
+        const tmp = [
+            new THREE.Mesh(A.noteBox, this.noteMaterial(0)), new THREE.Mesh(A.noteBox, this.noteMaterial(1)),
+            new THREE.Mesh(A.noteFace, A.arrowMat), new THREE.Mesh(A.noteFace, A.dotMat), new THREE.Mesh(A.bomb, A.bombMat),
+        ];
+        for (const m of tmp) { m.position.set(0, -50, 0); this.scene.add(m); }
+        const batches = Object.values(this.wallBatches);
+        for (const b of batches) b.mesh.visible = true;
+        try { this.engine.renderer.compile(this.scene, this.engine.camera); } catch (e) { /* compiled on first use instead */ }
+        for (const b of batches) b.mesh.visible = false;
+        for (const m of tmp) this.scene.remove(m);
     }
 
     // ----- materials -----
@@ -1364,24 +1689,31 @@ export class Gameplay {
         this.envMeshes = [];
         this.envGeos = [];
         this.trackedEnvMeshes = [];
+        this.envBatches = [];
         if (!list || !list.length) return;
 
         // Model maps place pieces 30–100m out; our default fog would swallow
         // them, so thin it while environment geometry is present.
         if (this.scene.fog) {
             this.scene.fog.density = Math.min(this.scene.fog.density, 0.009);
+            this._envFog = this.scene.fog.density;      // re-applied after a seek resets the lights
         }
 
         // No cap — model maps need every piece. Static (untracked) geometry is
         // merged per material into single draw calls so huge models stay fast.
         const staticBuckets = new Map();   // material -> geometries[]
+        const animBuckets = new Map();     // shape|material -> transform carriers (drawn instanced)
         const helper = new THREE.Object3D();
 
         for (const e of list) {
             const material = this.envMaterial(e.shader, e.color);
             if (e.track && e.track.length) {
-                // animated pieces stay individual so their track can move them
-                const mesh = new THREE.Mesh(this.envGeometry(e.type), material);
+                // animated pieces: each keeps a transform its track can move,
+                // drawn together with every piece of the same shape + material
+                const mesh = new THREE.Object3D();
+                const key = String(e.type) + '|' + material.uuid;
+                if (!animBuckets.has(key)) animBuckets.set(key, { geo: this.envGeometry(e.type), material, list: [] });
+                animBuckets.get(key).list.push(mesh);
                 this._envTransform(mesh, e, ENV_LOCAL_Z);
                 this.tracks.containerFor(e.track).add(mesh);
                 this.tracks.markEnv(e.track[0]);
@@ -1397,6 +1729,8 @@ export class Gameplay {
                 staticBuckets.get(material).push(geo);
             }
         }
+
+        for (const b of animBuckets.values()) this.envBatches.push(new EnvBatch(this.scene, b.geo, b.material, b.list));
 
         for (const [material, geometries] of staticBuckets) {
             let merged = null;
@@ -1455,14 +1789,14 @@ export class Gameplay {
         if (w) w.removeFromParent(); else o.removeFromParent();
         if (ud.ownMat) this.releaseMaterial(ud.mat);
         if (ud.ownFace) this.releaseMaterial(ud.faceMat);
-        if (ud.ownEdge) this.releaseMaterial(ud.edgeMat);
     }
 
     // does this object possibly need its own material (dissolve/color animation)?
     needsOwnMaterial(o) {
-        if (o.track) return true;
         const a = o.anim;
-        return !!(a && (a.dissolve || a.color || a.dissolveArrow));
+        if (a && (a.dissolve || a.color || a.dissolveArrow)) return true;
+        if (o.track) for (const name of o.track) if (this.fadeTracks.has(name)) return true;
+        return false;
     }
 
     spawnNote(n) {
@@ -1473,8 +1807,10 @@ export class Gameplay {
         if (own) mat = this.ownMaterial(mat);
         const box = new THREE.Mesh(n.chainLink ? A.chainBox : A.noteBox, mat);
         group.add(box);
+        const decorative = n.decorative || (!n.anim && !this.isReachable(n));
+        if (this.mods.ghost && !decorative) box.visible = false;      // Ghost Notes: arrows only
 
-        const dot = n.dir === 8 || n.chainLink;
+        const dot = n.dir === 8 || n.chainLink || !!this.mods.noArrows;
         let faceMat = dot ? A.dotMat : A.arrowMat;
         const ownFace = own && !!(n.track || (n.anim && n.anim.dissolveArrow));
         if (ownFace) faceMat = this.ownMaterial(faceMat);
@@ -1513,13 +1849,17 @@ export class Gameplay {
             baseColor: mat.color.clone(),
             speed: this.noteSpeed(n),
             rt: this.noteRt(n),
-            decorative: n.decorative || (!n.anim && !this.isReachable(n)),
+            decorative,
             animated,
             fxBuf: animated ? makeFx() : null,
             fx: null,
+            face,
+            size: this.noteScale,
             restQuat,
             swing: [swingX, swingY],
             wp: new THREE.Vector3(),
+            prevWp: new THREE.Vector3(),
+            prevZt: null,
             zt: 0,
             rev: this.replay ? (this.replay.match.noteEvents.get(n) || null) : null,
         };
@@ -1548,40 +1888,6 @@ export class Gameplay {
         this.liveBombs.push(mesh);
     }
 
-    wallMaterials(color, own) {
-        const distortion = settings.get('wallDistortion');
-        const key = 'w' + (distortion ? 'd' : 'b') + color.getHexString();
-        const make = () => {
-            const body = distortion
-                ? new THREE.ShaderMaterial({
-                    uniforms: {
-                        uColor: { value: color.clone() },
-                        uOpacity: { value: 1.0 },              // dissolve factor
-                        uTime: this.engine.wallUniforms.uTime,  // shared, updated once per frame
-                        uScene: this.engine.wallUniforms.uScene,
-                        uResolution: this.engine.wallUniforms.uResolution,
-                    },
-                    vertexShader: WALL_VERT,
-                    fragmentShader: WALL_FRAG,
-                    transparent: true, depthWrite: false, side: THREE.DoubleSide,
-                })
-                : new THREE.MeshBasicMaterial({
-                    color, transparent: true, opacity: 0.16, depthWrite: false,
-                    blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
-                });
-            const edge = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.7 });
-            return { body, edge };
-        };
-        if (own) {
-            const m = make();
-            this._ownMats.add(m.body); this._ownMats.add(m.edge);
-            return m;
-        }
-        let m = this._matCache.get(key);
-        if (!m) { m = make(); this._matCache.set(key, m); }
-        return m;
-    }
-
     // NE size[2] overrides duration-based length (grid units)
     wallLength(w) {
         return w.l != null
@@ -1603,26 +1909,28 @@ export class Gameplay {
         const length = this.wallLength(w);
         const color = new THREE.Color(0xff2d55);
         if (w.chroma) tameColor(color, w.chroma);
-        const own = this.needsOwnMaterial(w);
-        const { body, edge } = this.wallMaterials(color, own);
-        const mesh = new THREE.Mesh(A.wallBox, body);
-        mesh.add(new THREE.LineSegments(A.wallEdges, edge));
+        // drawn by the wall batches; this object only carries the transform
+        const mesh = new THREE.Object3D();
         const animated = !!(w.anim || w.track);
+        const x = colX(w.x) - COL_STEP / 2 + (w.w * COL_STEP) / 2;
+        const y = 0.1 + w.y * WALL_STEP + (w.h >= 0 ? height : -height) / 2;
         mesh.userData = {
             wall: w,
             // left edge at column x, extending `w.w` columns (negative w extends left)
-            x: colX(w.x) - COL_STEP / 2 + (w.w * COL_STEP) / 2,
-            y: 0.1 + w.y * WALL_STEP + (w.h >= 0 ? height : -height) / 2,
+            x, y,
             width, height, length,
-            mat: body, edgeMat: edge, ownMat: own, ownEdge: own,
-            baseColor: color.clone(),
+            batched: true,
+            // the costly distortion look is for real walls in the play area; wall art stays light
+            fancy: !w.decorative && Math.abs(x) < 2.4 && y < 4,
+            baseColor: color,
+            curColor: color.clone(),
+            curAlpha: 1,
             speed: this.noteSpeed(w),
             rt: this.noteRt(w),
             decorative: !!w.decorative,
             animated,
             fxBuf: animated ? makeFx() : null,
             restQuat: w.localRot ? unityQuat(w.localRot[0], w.localRot[1], w.localRot[2]) : null,
-            baseOpacity: body.isShaderMaterial ? 1 : 0.16,
             wp: new THREE.Vector3(),
         };
         mesh.userData.wrapper = this.attachObject(mesh, w);
@@ -1636,7 +1944,7 @@ export class Gameplay {
             if (this.replay) this.updateReplayCamera(dt);
             return;
         }
-        this.step(audio.songTime, dt);
+        this.step(audio.songTime - this.latency, dt);
     }
 
     step(t, dt) {
@@ -1668,8 +1976,12 @@ export class Gameplay {
             this.updateReplayPose(t);
             this.updateReplayCamera(dt);
         } else {
-            this.saberLeft.move(gamepad.leftStick, dt);
-            this.saberRight.move(gamepad.rightStick, dt);
+            const c = this.ctl, a = gamepad.raw;
+            let L = shapeStick(a[0], a[1], c.shape), R = shapeStick(a[2], a[3], c.shape);
+            if (c.swap) [L, R] = [R, L];
+            if (c.invertY) { L.y = -L.y; R.y = -R.y; }
+            this.saberLeft.move(L, dt, c.left);
+            this.saberRight.move(R, dt, c.right);
         }
 
         // spawn objects whose spawn time has arrived (queues pre-sorted by spawn time)
@@ -1708,6 +2020,12 @@ export class Gameplay {
             this._hud.prog = prog;
             this.$('hud-progress-fill').style.transform = `scaleX(${prog})`;
         }
+        const sec = Math.max(0, Math.floor(t));
+        if (sec !== this._hud.sec) {
+            this._hud.sec = sec;
+            const mmss = (v) => Math.floor(v / 60) + ':' + String(Math.floor(v % 60)).padStart(2, '0');
+            this.$('hud-time').textContent = `${mmss(sec)} / ${mmss(dur)}`;
+        }
     }
 
     // Apply combined Noodle effects (object anim + track paths + track values)
@@ -1730,27 +2048,29 @@ export class Gameplay {
         // dissolve / color (own materials only — shared ones stay untouched)
         const dis = fx && fx.hasDissolve ? clamp(fx.dissolve, 0, 1) : 1;
         o.visible = dis > 0.002;
-        if (ud.ownMat && ud.mat) {
+        if (ud.batched) {
+            let alpha = dis;
+            if (fx && fx.hasColor) {
+                const c = fx.color;
+                ud.curColor.setRGB(clamp(c[0], 0, 1), clamp(c[1], 0, 1), clamp(c[2], 0, 1));
+                alpha *= clamp(c[3] ?? 1, 0, 1);
+            } else ud.curColor.copy(ud.baseColor);
+            ud.curAlpha = alpha;
+            return;
+        }
+        if (ud.ownMat && ud.mat) {               // notes and bombs
             const m = ud.mat;
             let alpha = dis;
             if (fx && fx.hasColor) {
                 const c = fx.color;
-                if (m.isShaderMaterial) m.uniforms.uColor.value.setRGB(clamp(c[0], 0, 1), clamp(c[1], 0, 1), clamp(c[2], 0, 1));
-                else {
-                    m.color.setRGB(clamp(c[0], 0, 1), clamp(c[1], 0, 1), clamp(c[2], 0, 1));
-                    if (m.emissive) m.emissive.copy(m.color);
-                }
+                m.color.setRGB(clamp(c[0], 0, 1), clamp(c[1], 0, 1), clamp(c[2], 0, 1));
+                if (m.emissive) m.emissive.copy(m.color);
                 alpha *= clamp(c[3] ?? 1, 0, 1);
             } else if (ud.baseColor) {
-                if (m.isShaderMaterial) m.uniforms.uColor.value.copy(ud.baseColor);
-                else { m.color.copy(ud.baseColor); if (m.emissive) m.emissive.copy(ud.baseColor); }
+                m.color.copy(ud.baseColor);
+                if (m.emissive) m.emissive.copy(ud.baseColor);
             }
-            if (m.isShaderMaterial) m.uniforms.uOpacity.value = alpha;
-            else m.opacity = alpha * (ud.baseOpacity ?? 1);
-            if (ud.edgeMat && ud.ownEdge) {
-                ud.edgeMat.opacity = alpha * 0.7;
-                if (fx && fx.hasColor) ud.edgeMat.color.setRGB(clamp(fx.color[0], 0, 1), clamp(fx.color[1], 0, 1), clamp(fx.color[2], 0, 1));
-            }
+            m.opacity = alpha;
         }
         if (ud.ownFace && ud.faceMat) {
             ud.faceMat.opacity = fx && fx.hasDissolveArrow ? clamp(fx.dissolveArrow, 0, 1) : 1;
@@ -1771,7 +2091,7 @@ export class Gameplay {
                 // object's lane x/y per the Heck spec
                 g.position.set(ud.x + fx.def[0] * UNIT, ud.targetY + fx.def[1] * UNIT, -fx.def[2] * UNIT);
                 g.quaternion.copy(ud.restQuat);
-                g.scale.setScalar(1);
+                g.scale.setScalar(ud.size);
             } else {
                 // Noodle "time" property remaps the note's own life progress
                 const z = fx && fx.hasTime
@@ -1782,8 +2102,10 @@ export class Gameplay {
                 g.position.set(ud.x, THREE.MathUtils.lerp(ud.targetY - SPAWN_LEAD_Y, ud.targetY, easedRise), z);
                 g.quaternion.copy(ud.restQuat);
                 if (easedRise < 1) g.quaternion.multiply(_q.setFromAxisAngle(AXIS_Z, (1 - easedRise) * 0.8));
-                g.scale.setScalar(0.5 + easedRise * 0.5);
+                g.scale.setScalar((0.5 + easedRise * 0.5) * ud.size);
             }
+            // Disappearing Arrows: gone from just before halfway
+            if (this.mods.disappear && !ud.decorative) ud.face.visible = p < 0.6;
 
             if (ud.animated) this.applyNoodleFx(g, ud, fx);
             ud.fx = fx;
@@ -1823,13 +2145,31 @@ export class Gameplay {
             // animated interactable: fully interactable only when >= 1 (Heck spec)
             const uninteractableNow = ud.fx && ud.fx.hasInteractable && ud.fx.interactable < 1;
 
-            if (!uninteractableNow && zt > -1.0 && zt < 1.0) {
+            // Sweep the note and the blade across the whole frame: at a low frame
+            // rate a note can jump over the hit zone between two frames.
+            const z0 = ud.prevZt == null ? zt : ud.prevZt;
+            if (ud.prevZt == null) ud.prevWp.copy(ud.wp);
+            if (!uninteractableNow && zt > -1.0 && z0 < 1.0) {
                 const saber = n.color === 0 ? this.saberLeft : this.saberRight;
                 const wrongSaber = n.color === 0 ? this.saberRight : this.saberLeft;
-                if (saber.distanceTo(ud.wp) < 0.6) {
-                    this.hitNote(g, saber, i);
+                let best = Infinity;
+                for (let k = 0; k <= 4; k++) {
+                    const f = k / 4, z = z0 + (zt - z0) * f;
+                    if (z <= -1.0 || z >= 1.0) continue;
+                    _v.lerpVectors(ud.prevWp, ud.wp, f);
+                    best = Math.min(best, saber.distanceAt(_v, f));
+                }
+                if (best < 0.6) {
+                    // judge at the best moment of the contact, not the first touch:
+                    // a saber resting near a note shouldn't lock in an OK before the swing
+                    const j = this.judgeCut(saber, ud);
+                    if (!ud.contact || j.points > ud.contact.points) ud.contact = j;
+                    if (j.points >= 115 || zt >= 0.85) { this.hitNote(g, i, ud.contact); continue; }
+                    ud.prevZt = zt;
+                    ud.prevWp.copy(ud.wp);
                     continue;
                 }
+                if (ud.contact) { this.hitNote(g, i, ud.contact); continue; }      // blade has left the note
                 // wrong saber only counts against you on a deliberate fast swing
                 if (wrongSaber.distanceTo(ud.wp) < 0.22 && wrongSaber.smoothVel.length() > 1.6) {
                     this.badCut(g, i);
@@ -1837,11 +2177,15 @@ export class Gameplay {
                 }
             }
 
+            if (ud.contact) { this.hitNote(g, i, ud.contact); continue; }
             if (zt > 1.3 || (t - n.time) > 0.45) {
                 // a note that was uninteractable as it passed is never a miss
                 if (uninteractableNow) { this.removeObj(g); this.liveNotes.splice(i, 1); }
                 else this.miss(g, i);
+                continue;
             }
+            ud.prevZt = zt;
+            ud.prevWp.copy(ud.wp);
         }
     }
 
@@ -1850,7 +2194,7 @@ export class Gameplay {
         for (const saber of [this.saberLeft, this.saberRight]) {
             const want = saber === this.saberLeft ? 0 : 1;
             saber.group.updateWorldMatrix(true, false);
-            const sp = _v2.setFromMatrixPosition(saber.group.matrixWorld);
+            const sp = saber.cutPoint(_v2);
             let best = null, bestD = 1.1;
             for (const g of this.liveNotes) {
                 const ud = g.userData;
@@ -1861,8 +2205,10 @@ export class Gameplay {
             }
             if (best) {
                 const k = this.aimAssist * 0.45 * Math.max(0, 1 - bestD / 1.1);
-                // nudge in world space, converted back into the hand rig's space
-                _v.set(sp.x + (best.userData.wp.x - sp.x) * k, sp.y + (best.userData.wp.y - sp.y) * k, sp.z);
+                // nudge the hilt in world space, converted back into the hand rig's space
+                _v.setFromMatrixPosition(saber.group.matrixWorld);
+                _v.x += (best.userData.wp.x - sp.x) * k;
+                _v.y += (best.userData.wp.y - sp.y) * k;
                 saber.group.parent.worldToLocal(_v);
                 saber.group.position.x = _v.x;
                 saber.group.position.y = _v.y;
@@ -1877,23 +2223,35 @@ export class Gameplay {
         if (_swing.lengthSq() < 0.01) _swing.set(0, -1);
         _swing.normalize();
         const color = ud.mat.color;
-        this.engine.slices.spawn(ud.wp, _swing, color);
-        this.engine.particles.burst(ud.wp, color);
+        if (this.vis.halves) this.engine.slices.spawn(ud.wp, _swing, color);
+        const n = Math.round(18 * this.vis.particles);
+        if (n) this.engine.particles.burst(ud.wp, color, n);
     }
 
-    hitNote(g, saber, idx) {
-        const ud = g.userData;
+    // Friendly scoring: any contact scores; direction + a real flick earn the bonus
+    judgeCut(saber, ud) {
         const n = ud.note;
         const vel = saber.smoothVel;
         const speed = vel.length();
-
-        // Friendly scoring: any contact scores; direction + a real flick earn the bonus
-        let judgement = 'OK', points = 80;
         const dv = ud.swing;
         const dot = speed > 0.3 ? (vel.x * dv[0] + vel.y * dv[1]) / speed : 0;
-        const dirOk = n.dir === 8 || n.chainLink || dot > 0.45;
+        const dirOk = n.dir === 8 || n.chainLink || !!this.mods.noArrows || dot > 0.45;
+        let judgement = 'OK', points = 80;
         if (dirOk && speed > 1.1) { judgement = 'PERFECT'; points = 115; }
         else if (speed > 0.35) { judgement = 'GOOD'; points = 100; }
+        // Strict Angles: only a cut along the arrow counts
+        if (this.mods.strict && !dirOk) points = 0;
+        return { judgement, points, dirOk, vel: vel.clone() };
+    }
+
+    hitNote(g, idx, cut) {
+        const n = g.userData.note;
+        // Strict Angles: a cut against the arrow counts as a bad cut
+        if (this.mods.strict && !cut.dirOk) { this.badCut(g, idx, 'WRONG WAY'); return; }
+        const { judgement, points } = cut;
+        const vel = cut.vel;
+        this.judge[judgement.toLowerCase()]++;
+        this.judge[n.color === 0 ? 'left' : 'right']++;
 
         this.score += points * this.multiplier;
         this.combo++;
@@ -1903,25 +2261,27 @@ export class Gameplay {
         this.bumpMultiplier();
         this.energy = Math.min(1, this.energy + 0.009);
 
-        audio.playHit(judgement === 'PERFECT' ? 1.0 : 0.85);
+        this.playHitSound(judgement === 'PERFECT' ? 1.0 : 0.85);
         gamepad.rumble(60, 0.5, 0.2);
 
-        this.showJudgement(judgement);
+        if (this.vis.judge === 'numbers') this.showJudgement(String(points), points >= 115 ? '#ffd76a' : points >= 100 ? '#ffffff' : '#9fd8ff');
+        else if (this.vis.judge !== 'off') this.showJudgement(judgement);
         this.cutEffects(g, vel);
         this.removeObj(g);
         this.liveNotes.splice(idx, 1);
         this.updateHud(true);
     }
 
-    badCut(g, idx) {
+    badCut(g, idx, label = 'WRONG SABER') {
         this.combo = 0;
         this.multiplier = 1;
         this.multProgress = 0;
         this.processed++;
         this.misses++;
-        this.addEnergy(-0.05);
-        audio.playSfx('miss', 0.6);
-        this.showJudgement('WRONG SABER', '#ff5a5a');
+        this.judge.bad++;
+        this.addEnergy(this.mods.instantFail ? -2 : -0.05);
+        this.playMissSound(0.6);
+        this.showJudgement(label, '#ff5a5a');
         this.removeObj(g);
         this.liveNotes.splice(idx, 1);
         this.updateHud();
@@ -1933,8 +2293,9 @@ export class Gameplay {
         this.multProgress = 0;
         this.processed++;
         this.misses++;
-        this.addEnergy(-0.07);
-        audio.playSfx('miss', 0.55);
+        this.judge.miss++;
+        this.addEnergy(this.mods.instantFail ? -2 : -0.07);
+        this.playMissSound(0.55);
         this.showJudgement('MISS', '#ff5a5a');
         this.removeObj(g);
         this.liveNotes.splice(idx, 1);
@@ -1999,12 +2360,14 @@ export class Gameplay {
         else {
             this.combo = 0;
             this.multiplier = 1; this.multProgress = 0;
-            this.addEnergy(-0.13);
+            this.judge.bomb++;
+            this.addEnergy(this.mods.instantFail ? -2 : -0.13);
         }
-        if (!this.replay || this.ro.hitSounds) audio.playSfx('miss', 0.9, 0.7);
+        if (!this.replay || this.ro.hitSounds) this.playMissSound(0.9, 0.7);
         if (!this.replay) gamepad.rumble(220, 1, 1);
         this.showJudgement('BOMB!', '#ff2d2d');
-        this.engine.particles.burst(ud.wp, _bombColor, 26);
+        const nb = Math.round(26 * this.vis.particles);
+        if (nb) this.engine.particles.burst(ud.wp, _bombColor, nb);
         this.removeObj(m);
         this.liveBombs.splice(i, 1);
         this.updateHud();
@@ -2029,10 +2392,15 @@ export class Gameplay {
             if (ud.restQuat) m.quaternion.copy(ud.restQuat); else m.quaternion.identity();
             m.scale.set(ud.width, ud.height, ud.length);
             if (ud.animated) this.applyNoodleFx(m, ud, fx);
+            // world matrix now (its container's was refreshed in moveNotes) — the batch copies it
+            const wr = ud.wrapper;
+            m.updateMatrix();
+            wr.updateMatrix();
+            wr.matrixWorld.multiplyMatrices(wr.parent.matrixWorld, wr.matrix);
+            m.matrixWorld.multiplyMatrices(wr.matrixWorld, m.matrix);
 
             // saber inside a real wall drains energy a bit (never for wall art)
             if (!ud.decorative && !this.replay && headZ > -2 && headZ - ud.length < 2) {
-                m.updateWorldMatrix(true, false);
                 ud.wp.setFromMatrixPosition(m.matrixWorld);
                 const inside = (saber) => {
                     const p = saber.tip;
@@ -2051,6 +2419,38 @@ export class Gameplay {
                 this.liveWalls.splice(i, 1);
             }
         }
+        this.flushBatches();
+    }
+
+    // copy this frame's wall / environment transforms into the instanced batches
+    flushBatches() {
+        const B = this.wallBatches, walls = this.liveWalls;
+        // environment carriers were placed before moveNotes refreshed every world matrix
+        for (const eb of this.envBatches) eb.update();
+        if (!walls.length && !B.fancy.mesh.visible && !B.plain.mesh.visible) return;
+        B.fancy.begin(walls.length);
+        B.plain.begin(walls.length);
+        if (walls.length) {
+            const list = this._fancyList || (this._fancyList = []);
+            list.length = 0;
+            let budget = this.wallFancy ? FANCY_WALLS : 0;
+            this.engine.camera.getWorldPosition(_camPos);
+            for (const m of walls) {
+                const ud = m.userData;
+                if (!m.visible || ud.curAlpha <= 0.002) continue;
+                if (ud.fancy && budget > 0) {
+                    budget--;
+                    const e = m.matrixWorld.elements;
+                    ud.depth = (e[12] - _camPos.x) ** 2 + (e[13] - _camPos.y) ** 2 + (e[14] - _camPos.z) ** 2;
+                    list.push(m);
+                } else B.plain.push(m.matrixWorld, ud.curColor, ud.curAlpha);
+            }
+            // see-through walls blend correctly drawn far to near
+            list.sort((a, b) => b.userData.depth - a.userData.depth);
+            for (const m of list) B.fancy.push(m.matrixWorld, m.userData.curColor, m.userData.curAlpha);
+        }
+        B.fancy.end();
+        B.plain.end();
     }
 
     bumpMultiplier() {
@@ -2155,6 +2555,7 @@ export class Gameplay {
         this.processed = 0;
         this.maxScore = 0;           // replay: max possible so far (Beat Saber rules)
         this.energy = 0.5;
+        this.judge = { perfect: 0, good: 0, ok: 0, bad: 0, miss: 0, bomb: 0, left: 0, right: 0 };
         this.stats = {               // replay stats overlay
             hand: [{ n: 0, sum: 0 }, { n: 0, sum: 0 }],   // left (red), right (blue)
             pre: 0, preN: 0, acc: 0, accN: 0, post: 0, postN: 0,
@@ -2208,12 +2609,16 @@ export class Gameplay {
         this.stats.walls++;
     }
 
-    // Jump the replay to song time `target`. Score, lights, Noodle animation
-    // and every object on screen are rebuilt as they'd be at that moment.
+    // Jump to song time `target`. Lights, Noodle animation and every object on
+    // screen are rebuilt as they'd be at that moment; a replay's score is too
+    // (in normal play — practice mode — scoring starts over from there).
     seek(target) {
-        if (!this.replay || this.finished) return;
+        if (this.finished) return;
+        const R = !!this.replay;
         const st = this.replayState;
-        target = clamp(target, Math.min(this.replayStartAt, 0), Math.max(0, this.replayEnd - 0.05));
+        target = R
+            ? clamp(target, Math.min(this.replayStartAt, 0), Math.max(0, this.replayEnd - 0.05))
+            : clamp(target, -3, Math.max(0, (audio.songDuration || 0) - 0.05));
 
         for (const g of this.liveNotes) this.removeObj(g);
         for (const m of this.liveBombs) this.removeObj(m);
@@ -2225,18 +2630,21 @@ export class Gameplay {
         this.saberRight.resetTrail();
 
         this.resetScore();
-        for (const e of st.timeline) {
-            if (e.time > target) break;
-            if (e.kind === 0) this.scoreReplayNote(e.ev, e.color);
-            else if (e.kind === 1) this.scoreReplayBomb();
-            else this.scoreReplayWall(e.ev);
+        if (R) {
+            for (const e of st.timeline) {
+                if (e.time > target) break;
+                if (e.kind === 0) this.scoreReplayNote(e.ev, e.color);
+                else if (e.kind === 1) this.scoreReplayBomb();
+                else this.scoreReplayWall(e.ev);
+            }
+            st.wallIdx = 0;
+            while (st.wallIdx < st.walls.length && st.walls[st.wallIdx].time <= target) st.wallIdx++;
         }
-        st.wallIdx = 0;
-        while (st.wallIdx < st.walls.length && st.walls[st.wallIdx].time <= target) st.wallIdx++;
 
         // lights and Noodle tracks: from the start, up to the target
         this.engine.resetLights();
         if (this.map.environment && this.map.environment.hideGroups) this.engine.hideDecor(this.map.environment.hideGroups);
+        if (this._envFog != null && this.scene.fog) this.scene.fog.density = this._envFog;
         const evs = this.map.events;
         this.eventIdx = 0;
         while (this.eventIdx < evs.length && evs[this.eventIdx].time <= target) this.engine.handleEvent(evs[this.eventIdx++]);
@@ -2244,21 +2652,23 @@ export class Gameplay {
         this.tracks.update(target);
 
         // respawn what is on screen at the target (spawned, not yet resolved or gone)
-        const M = this.replay.match;
         const respawn = (queue, spawn, alive) => {
             let i = 0;
             for (; i < queue.length && queue[i].at <= target; i++) if (alive(queue[i].o)) spawn.call(this, queue[i].o);
             return i;
         };
+        // replays: until the recorded hit; normal play: notes not reached yet
         const aliveNote = (events) => (o) => {
-            const ev = events.get(o);
-            return ev ? ev.eventTime > target : target - o.time <= 2.5 * this.noteRt(o);
+            const ev = events && events.get(o);
+            if (ev) return ev.eventTime > target;
+            return events || o.decorative ? target - o.time <= 2.5 * this.noteRt(o) : o.time >= target;
         };
-        this.noteIdx = respawn(this.noteQueue, this.spawnNote, aliveNote(M.noteEvents));
-        this.bombIdx = respawn(this.bombQueue, this.spawnBomb, aliveNote(M.bombEvents));
+        const M = R ? this.replay.match : null;
+        this.noteIdx = respawn(this.noteQueue, this.spawnNote, aliveNote(M && M.noteEvents));
+        this.bombIdx = respawn(this.bombQueue, this.spawnBomb, aliveNote(M && M.bombEvents));
         this.wallIdx = respawn(this.wallQueue, this.spawnWall, (w) => !this.wallGone(w, target, this.noteRt(w), this.noteSpeed(w), this.wallLength(w)));
 
-        audio.seek(target);
+        audio.seek(target + this.latency);
         this._camSnap = true;
         this._hud.prog = -1;
         this.updateHud();
@@ -2300,6 +2710,32 @@ export class Gameplay {
         this.camLocalHome.z -= HIT_Z;
         this.applyReplaySettings();
         this.setCameraMode(this.camMode);
+    }
+
+    // thumbstick → saber mapping (Settings → Controls)
+    applyControlSettings() {
+        const S = settings;
+        const spread = S.num('saberRestSpread', 0, 1);
+        const base = {
+            restY: S.num('saberRestHeight', 0.6, 2.2),
+            reachX: S.num('saberReachX', 0.4, 2.5),
+            reachY: S.num('saberReachY', 0.3, 1.6),
+            smooth: S.num('saberSmoothing', 0, 0.12),
+            tilt: S.num('saberTilt', 0, 75) * DEG,
+        };
+        this.ctl = {
+            shape: {
+                deadzone: S.num('stickDeadzone', 0, 0.6),
+                outer: S.num('stickRange', 0.6, 1),
+                curve: S.num('stickCurve', 0.4, 3),
+                square: S.get('stickSquare') !== false,
+            },
+            swap: !!S.get('swapSticks'),
+            invertY: !!S.get('invertY'),
+            left: { ...base, restX: -spread },
+            right: { ...base, restX: spread },
+        };
+        gamepad.rumbleScale = S.num('rumble', 0, 1);
     }
 
     applyReplaySettings() {
@@ -2446,13 +2882,13 @@ export class Gameplay {
             const ev = g.userData.rev;
             const p = this.scoreReplayNote(ev, g.userData.note.color);
             if (p) {
-                if (sounds) audio.playHit(p.total >= 110 ? 1.0 : 0.85);
+                if (sounds) this.playHitSound(p.total >= 110 ? 1.0 : 0.85);
                 this.showCutScore(p);
                 const sd = ev.cut.saberDir;
                 this.cutEffects(g, _swing.set(sd[0], sd[1]));
             } else {
                 const bad = ev.eventType === NOTE_EVENT.BAD;
-                if (sounds) audio.playSfx('miss', 0.55);
+                if (sounds) this.playMissSound(0.55);
                 this.showJudgement(bad ? 'BAD CUT' : 'MISS', '#ff5a5a');
             }
             this.removeObj(g);
@@ -2592,6 +3028,8 @@ export class Gameplay {
             failed: this.failed,
             fullCombo: this.misses === 0 && this.processed > 0,
             replay: !!this.replay,
+            judge: { ...this.judge },
+            practice: !this.replay && (this.mods.practiceStart > 0 || (Number(this.mods.speed) || 1) < 1),
         };
         setTimeout(() => this.opts.onEnd(results), this.failed ? 300 : 600);
     }
@@ -2607,6 +3045,10 @@ export class Gameplay {
         this.engine.slices.clear();
 
         for (const m of (this.envMeshes || [])) m.removeFromParent();
+        for (const b of (this.envBatches || [])) b.dispose();
+        this.envBatches = [];
+        this.wallBatches.fancy.dispose();
+        this.wallBatches.plain.dispose();
         for (const g of (this.envGeos || [])) g.dispose();
         for (const k in (this._envGeoCache || {})) this._envGeoCache[k].dispose();
         this.envMeshes = []; this.envGeos = []; this.trackedEnvMeshes = [];
@@ -2623,6 +3065,7 @@ export class Gameplay {
         cam.position.copy(this.engine.camHome);
         cam.quaternion.copy(this.engine.camHomeQuat);
         this.engine.setFov(settings.num('camFov', 30, 140));
+        this.engine.leaveLightMode();
         this.$('hud').classList.remove('hud-off');
         const sp = this.$('replay-stats');
         if (sp) sp.classList.add('hidden');

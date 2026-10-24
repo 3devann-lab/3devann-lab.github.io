@@ -16,6 +16,7 @@ engine.onContextLost = () => {
     toast('Graphics were reset by the browser — recovering…', 'error');
     if (menu.gameplay && !menu.gameplay.paused && !menu.gameplay.finished) menu.pauseGame();
 };
+engine.onLightMode = () => toast('This map is very heavy for your device — switched to lighter graphics so it keeps running', 'error');
 // A level whose data keeps throwing every frame gets ended instead of hanging
 engine.onGameplayError = (err) => {
     toast('This level hit an error and was stopped: ' + (err && err.message ? err.message : err), 'error');

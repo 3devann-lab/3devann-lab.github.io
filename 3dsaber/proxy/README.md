@@ -2,8 +2,13 @@
 
 BeatLeader only lets its own website (and `localhost` dev ports) read player and level
 data from a browser. On any other site, like evanblokender.org, **Players** and **Levels**
-search need a small proxy in between. Without one the game tries free public relays, but
-those are slow and often down, so search may not load.
+search need a small proxy in between.
+
+The game uses `https://shy-mud-5208.3devann.workers.dev` by default (set in `js/beatleader.js`,
+`DEFAULT_PROXY`). Redeploying it with the current `cloudflare-worker.js` adds a `/health` page and
+automatic failover between api.beatleader.com and api.beatleader.xyz. Anyone can point the game at a
+different worker in **Settings → BeatLeader Proxy**, or type `off` to use only the free public relays
+(slow and often down).
 
 Things that work **without** a proxy:
 - **Replays → Live**: every replay set on BeatLeader appears the moment it's set (you can filter by player or song)
