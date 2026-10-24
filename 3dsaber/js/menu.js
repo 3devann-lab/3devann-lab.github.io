@@ -1,7 +1,7 @@
 // ============ Menu system: screens, BeatSaver browser, replays, pause/results ============
 import { audio } from './audio.js';
 import { gamepad, cursor } from './input.js';
-import { settings, getHighScore, setHighScore, getBestScores } from './settings.js';
+import { settings, getHighScore, setHighScore, getBestScores, CAMERA_KEYS } from './settings.js';
 import {
     searchMaps, downloadMap, getSavedMaps, getSavedMap, deleteSavedMap,
     getSavedIds, findSavedByHash, getMapByHash, mapAvailable, isDownloadableHash,
@@ -15,20 +15,14 @@ import {
     getScoreById, fetchReplay, parseReplayLink, countryFlag,
     BeatLeaderUnreachable, liveScores, scoreMatches, testProxy, normalizeProxyUrl,
 } from './beatleader.js';
+import { ReplayControls } from './replayui.js';
+import {
+    toast, esc, fmt, settingBuilders, PLAY_CAMERA_ROWS, FIRST_PERSON_ROWS, FOLLOW_ROWS, REPLAY_VIEW_ROWS,
+} from './ui.js';
+
+export { toast };
 
 const $ = (id) => document.getElementById(id);
-
-export function toast(msg, type = '') {
-    const el = document.createElement('div');
-    el.className = 'toast ' + type;
-    el.textContent = msg;
-    $('toast-container').appendChild(el);
-    setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 350); }, type === 'error' ? 4200 : 2600);
-}
-
-function esc(s) {
-    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
 
 function fmtDuration(sec) {
     if (!sec) return '';
@@ -86,12 +80,10 @@ export class Menu {
         window.addEventListener('keydown', (e) => {
             if (e.target && e.target.matches && e.target.matches('input[type="text"], input[type="search"], input[type="url"]')) return;
             const gp = this.gameplay;
-            if (!gp || gp.finished) return;
-            if (e.key === 'Escape' || (gp.replay && e.key === ' ')) {
+            if (!gp || gp.finished || gp.replay) return;      // replays: ReplayControls has the keys
+            if (e.key === 'Escape') {
                 e.preventDefault();
                 gp.paused ? this.resumeGame() : this.pauseGame();
-            } else if (gp.replay && (e.key === 'c' || e.key === 'C') && !gp.paused) {
-                this.toggleReplayCamera();
             }
         });
 
@@ -346,7 +338,6 @@ export class Menu {
             cursor.disable();
             $('hint-bar').classList.add('hidden');
             $('hud').classList.remove('hidden');
-            $('replay-hint').classList.toggle('hidden', !replay);
 
             this.gameplay = new Gameplay(this.engine, mapData, songBuffer, {
                 songName,
@@ -358,6 +349,7 @@ export class Menu {
                 onEnd: (results) => this.endLevel(results, mapId, diff),
             });
             this.engine.gameplay = this.gameplay;
+            if (replay) this.replayControls = new ReplayControls(this, this.gameplay);
             this.checkAudioUnlocked();
         } catch (err) {
             console.error(err);
@@ -393,9 +385,9 @@ export class Menu {
         const isReplay = !!results.replay;
         const isNewBest = !isReplay && !results.failed && setHighScore(mapId, diff.characteristic, diff.difficulty, results);
         this.engine.gameplay = null;
+        this.closeReplayControls();
         if (this.gameplay) { this.gameplay.destroy(); this.gameplay = null; }
         $('hud').classList.add('hidden');
-        $('replay-hint').classList.add('hidden');
         this.showResults(results, isNewBest);
     }
 
@@ -437,27 +429,29 @@ export class Menu {
         if (!this.gameplay || this.gameplay.finished) return;
         const gp = this.gameplay;
         gp.pause();
-        const isReplay = !!gp.replay;
+        if (gp.replay && this.replayControls) {
+            // replays pause in place: the picture stays, the bar and free camera still work
+            this.replayControls.setPaused(true);
+            cursor.speed = settings.get('cursorSpeed');
+            cursor.enable();
+            cursor.onBack = () => this.resumeGame();
+            return;
+        }
         this.setScreen(`
         <div class="screen">
             <div class="modal" style="width:min(400px,90vw)">
                 <div class="result-title">PAUSED</div>
                 <div class="menu-buttons" style="width:100%">
                     <button class="btn primary" id="btn-resume">Resume</button>
-                    ${isReplay ? `<button class="btn" id="btn-camera">Camera: ${gp.camMode === 'first' ? 'First Person' : 'Third Person'}</button>` : ''}
-                    <button class="btn" id="btn-restart">${isReplay ? 'Restart Replay' : 'Restart'}</button>
-                    <button class="btn danger" id="btn-quit">${isReplay ? 'Quit to Replays' : 'Quit to Menu'}</button>
+                    <button class="btn" id="btn-camera">Camera</button>
+                    <button class="btn" id="btn-restart">Restart</button>
+                    <button class="btn danger" id="btn-quit">Quit to Menu</button>
                 </div>
             </div>
         </div>`);
         this.enterMenuMode(() => this.resumeGame());
         $('btn-resume').onclick = () => this.resumeGame();
-        if (isReplay) {
-            $('btn-camera').onclick = () => {
-                const mode = gp.toggleCamera();
-                $('btn-camera').textContent = `Camera: ${mode === 'first' ? 'First Person' : 'Third Person'}`;
-            };
-        }
+        $('btn-camera').onclick = () => this.showPauseCamera();
         $('btn-restart').onclick = () => {
             this.abortGameplay();
             const { builtinSong, record, diff, replayCtx } = this.currentLevel;
@@ -465,25 +459,66 @@ export class Menu {
         };
         $('btn-quit').onclick = () => {
             this.abortGameplay();
-            if (isReplay) this.showReplays(); else this.showHome();
+            this.showHome();
         };
+    }
+
+    // camera options from the pause menu — the paused frame updates as you drag
+    showPauseCamera() {
+        this.setScreen(`
+        <div class="screen pause-camera">
+            <div class="panel" style="max-width:560px;max-height:min(640px,90vh)">
+                <div class="panel-header">
+                    <div class="panel-title">CAMERA</div>
+                    <button class="btn small" id="btn-back">← Back</button>
+                </div>
+                <div class="panel-body" id="cam-body"></div>
+            </div>
+        </div>`);
+        this.enterMenuMode(() => this.pauseGame());
+        $('btn-back').onclick = () => this.pauseGame();
+        const b = settingBuilders($('cam-body'), (k) => this.applySettingChange(k));
+        b.section('Play camera', 'Where you watch your sabers from', () => {
+            settings.reset(['camFov', 'camHeight', 'camDistance', 'camTilt']);
+            this.engine.applyCameraSettings();
+            this.showPauseCamera();
+        });
+        b.rows(PLAY_CAMERA_ROWS);
+        b.rows(REPLAY_VIEW_ROWS.filter(r => r[1] === 'trailLength'));
+    }
+
+    // live effects of a settings change (Settings screen and pause menu)
+    applySettingChange(key) {
+        const v = settings.get(key);
+        if (CAMERA_KEYS.includes(key)) this.engine.applyCameraSettings();
+        else if (key === 'trailLength' || key.startsWith('replay')) { if (this.gameplay) this.gameplay.applyReplaySettings(); }
+        else if (key === 'musicVolume' || key === 'sfxVolume') audio.setVolumes(settings.get('musicVolume'), settings.get('sfxVolume'));
+        else if (key === 'cursorSpeed') cursor.speed = v;
+        else if (key === 'bloomStrength') this.engine.setBloomStrength(v);
+        else if (key === 'bloom') this.engine.setBloom(v);
+        else if (key === 'quality') this.engine.setQuality(v);
     }
 
     resumeGame() {
         if (!this.gameplay) return;
-        this.setScreen('');
+        if (this.replayControls) this.replayControls.setPaused(false);
+        else this.setScreen('');
         cursor.disable();
         $('hint-bar').classList.add('hidden');
         this.gameplay.resume();
     }
 
-    toggleReplayCamera() {
-        if (!this.gameplay || !this.gameplay.replay) return;
-        const mode = this.gameplay.toggleCamera();
-        toast(mode === 'first' ? 'Camera: first person (player\'s view)' : 'Camera: third person');
+    quitReplay() {
+        this.abortGameplay();
+        this.showReplays();
+    }
+
+    closeReplayControls() {
+        if (this.replayControls) { this.replayControls.destroy(); this.replayControls = null; }
     }
 
     abortGameplay() {
+        this.closeReplayControls();
         if (this.gameplay) {
             audio.resume();
             this.gameplay.destroy();
@@ -491,7 +526,6 @@ export class Menu {
         }
         this.engine.gameplay = null;
         $('hud').classList.add('hidden');
-        $('replay-hint').classList.add('hidden');
         $('countdown').classList.add('hidden');
     }
 
@@ -1136,6 +1170,12 @@ export class Menu {
             <div class="panel" style="max-width:720px">
                 <div class="panel-header">
                     <div class="panel-title">SETTINGS</div>
+                    <div class="seg settings-jump">
+                        <button class="sort-btn" data-jump="sec-game">Gameplay</button>
+                        <button class="sort-btn" data-jump="sec-camera">Camera</button>
+                        <button class="sort-btn" data-jump="sec-replays">Replays</button>
+                        <button class="sort-btn" data-jump="sec-graphics">Graphics</button>
+                    </div>
                     <button class="btn small" id="btn-back">← Back</button>
                 </div>
                 <div class="panel-body" id="settings-body"></div>
@@ -1145,101 +1185,54 @@ export class Menu {
         $('btn-back').onclick = () => this.showHome();
 
         const body = $('settings-body');
-
-        const slider = (key, label, sub, min, max, step, fmt) => {
-            const row = document.createElement('div');
-            row.className = 'setting-row';
-            row.innerHTML = `
-                <div class="setting-label">${label}<small>${sub}</small></div>
-                <div class="setting-control">
-                    <input type="range" min="${min}" max="${max}" step="${step}" value="${s.get(key)}">
-                    <div class="setting-value">${fmt(s.get(key))}</div>
-                </div>`;
-            const input = row.querySelector('input');
-            input.oninput = () => {
-                const v = Number(input.value);
-                s.set(key, v);
-                row.querySelector('.setting-value').textContent = fmt(v);
-                if (key === 'musicVolume' || key === 'sfxVolume') {
-                    audio.setVolumes(s.get('musicVolume'), s.get('sfxVolume'));
-                }
-                if (key === 'cursorSpeed') cursor.speed = v;
-                if (key === 'bloomStrength') this.engine.setBloomStrength(v);
-            };
-            body.appendChild(row);
+        const b = settingBuilders(body, (k) => this.applySettingChange(k));
+        const resetAndRedraw = (keys, msg) => () => {
+            s.reset(keys);
+            this.engine.applyCameraSettings();
+            const top = body.scrollTop;
+            this.showSettings();
+            $('settings-body').scrollTop = top;
+            toast(msg);
         };
+        this.root.querySelectorAll('[data-jump]').forEach(btn => {
+            btn.onclick = () => { const el = $(btn.dataset.jump); if (el) body.scrollTop = el.offsetTop - body.offsetTop - 8; };
+        });
 
-        const toggle = (key, label, sub, onChange) => {
-            const row = document.createElement('div');
-            row.className = 'setting-row';
-            row.innerHTML = `
-                <div class="setting-label">${label}<small>${sub}</small></div>
-                <div class="setting-control"><div class="toggle ${s.get(key) ? 'on' : ''}"></div></div>`;
-            const t = row.querySelector('.toggle');
-            t.onclick = () => {
-                const v = !s.get(key);
-                s.set(key, v);
-                t.classList.toggle('on', v);
-                if (onChange) onChange(v);
-                audio.playClick(v ? 880 : 440);
-            };
-            body.appendChild(row);
-        };
+        b.section('Gameplay').id = 'sec-game';
+        b.slider('musicVolume', 'Music Volume', 'Song playback level', 0, 1, 0.05, fmt.pct);
+        b.slider('sfxVolume', 'Effects Volume', 'Hit sounds and UI', 0, 1, 0.05, fmt.pct);
+        b.slider('noteSpeed', 'Note Speed', 'Multiplier on map note-jump speed', 0.7, 1.5, 0.05, fmt.x);
+        b.slider('aimAssist', 'Aim Assist', 'Sabers magnetize toward matching notes', 0, 1, 0.1, fmt.pct);
+        b.slider('cursorSpeed', 'Cursor Speed', 'Right-stick menu cursor sensitivity', 0.5, 2, 0.1, (v) => v.toFixed(1) + 'x');
+        b.color('leftColor', 'Left Saber Color', 'Also tints left-hand notes');
+        b.color('rightColor', 'Right Saber Color', 'Also tints right-hand notes');
+        b.rows(REPLAY_VIEW_ROWS.filter(r => r[1] === 'trailLength'));
+        b.toggle('noFail', 'No Fail', 'Never fail a song — chill mode');
 
-        const color = (key, label, sub) => {
-            const row = document.createElement('div');
-            row.className = 'setting-row';
-            row.innerHTML = `
-                <div class="setting-label">${label}<small>${sub}</small></div>
-                <div class="setting-control"><input type="color" value="${s.get(key)}"></div>`;
-            row.querySelector('input').oninput = (e) => s.set(key, e.target.value);
-            body.appendChild(row);
-        };
+        b.section('Play camera', 'Where you watch your sabers from (also the replay third-person view)',
+            resetAndRedraw(['camFov', 'camHeight', 'camDistance', 'camTilt'], 'Play camera reset')).id = 'sec-camera';
+        b.rows(PLAY_CAMERA_ROWS);
+        b.section('Replay first-person camera', 'The player\'s own view (C / Y while watching)',
+            resetAndRedraw(CAMERA_KEYS.filter(k => k.startsWith('fp')), 'First-person camera reset'));
+        b.rows(FIRST_PERSON_ROWS);
+        b.section('Replay follow camera', 'Chases the player\'s head from behind',
+            resetAndRedraw(CAMERA_KEYS.filter(k => k.startsWith('follow')), 'Follow camera reset'));
+        b.rows(FOLLOW_ROWS);
 
-        const choice = (key, label, sub, options, onChange) => {
-            const row = document.createElement('div');
-            row.className = 'setting-row';
-            row.innerHTML = `
-                <div class="setting-label">${label}<small>${sub}</small></div>
-                <div class="setting-control seg">${options.map(([v, l]) =>
-                    `<button class="sort-btn ${s.get(key) === v ? 'active' : ''}" data-v="${v}">${l}</button>`).join('')}</div>`;
-            row.querySelectorAll('[data-v]').forEach(b => {
-                b.onclick = () => {
-                    s.set(key, b.dataset.v);
-                    row.querySelectorAll('[data-v]').forEach(x => x.classList.toggle('active', x === b));
-                    if (onChange) onChange(b.dataset.v);
-                };
-            });
-            body.appendChild(row);
-        };
+        b.section('Replays', 'Everything here can also be changed while watching (⚙ Options)',
+            resetAndRedraw(['replayCamera', 'replayHud', 'replayCutText', 'replayHitSounds', 'replayStats',
+                'replayHead', 'replaySkipIntro', 'replayShowMisses'], 'Replay options reset')).id = 'sec-replays';
+        b.rows(REPLAY_VIEW_ROWS.filter(r => r[1] !== 'trailLength'));
 
-        const text = (key, label, sub, placeholder) => {
-            const row = document.createElement('div');
-            row.className = 'setting-row';
-            row.innerHTML = `
-                <div class="setting-label">${label}<small>${sub}</small></div>
-                <div class="setting-control"><input class="search-box setting-text" type="text" placeholder="${esc(placeholder)}" value="${esc(s.get(key) || '')}"></div>`;
-            row.querySelector('input').onchange = (e) => { s.set(key, e.target.value.trim()); toast('Saved'); };
-            body.appendChild(row);
-            return row;
-        };
+        b.section('Graphics').id = 'sec-graphics';
+        b.choice('quality', 'Graphics Quality', 'Auto lowers resolution when frames run slow',
+            [['auto', 'Auto'], ['high', 'High'], ['medium', 'Medium'], ['low', 'Low']]);
+        b.toggle('bloom', 'Glow / Bloom', 'Fancy graphics. Turn off on slow devices');
+        b.toggle('wallDistortion', 'Wall Distortion', 'Real-time energy-field effect on walls');
+        b.slider('bloomStrength', 'Glow Intensity', 'How strong the bloom glow is', 0, 1.2, 0.05, (v) => v.toFixed(2));
 
-        const pct = (v) => Math.round(v * 100) + '%';
-        slider('musicVolume', 'Music Volume', 'Song playback level', 0, 1, 0.05, pct);
-        slider('sfxVolume', 'Effects Volume', 'Hit sounds and UI', 0, 1, 0.05, pct);
-        slider('noteSpeed', 'Note Speed', 'Multiplier on map note-jump speed', 0.7, 1.5, 0.05, (v) => v.toFixed(2) + 'x');
-        slider('aimAssist', 'Aim Assist', 'Sabers magnetize toward matching notes', 0, 1, 0.1, pct);
-        slider('cursorSpeed', 'Cursor Speed', 'Right-stick menu cursor sensitivity', 0.5, 2, 0.1, (v) => v.toFixed(1) + 'x');
-        color('leftColor', 'Left Saber Color', 'Also tints left-hand notes');
-        color('rightColor', 'Right Saber Color', 'Also tints right-hand notes');
-        toggle('noFail', 'No Fail', 'Never fail a song — chill mode', null);
-        choice('quality', 'Graphics Quality', 'Auto lowers resolution when frames run slow',
-            [['auto', 'Auto'], ['high', 'High'], ['medium', 'Medium'], ['low', 'Low']],
-            (v) => this.engine.setQuality(v));
-        toggle('bloom', 'Glow / Bloom', 'Fancy graphics. Turn off on slow devices', (v) => this.engine.setBloom(v));
-        toggle('wallDistortion', 'Wall Distortion', 'Real-time energy-field effect on walls', null);
-        slider('bloomStrength', 'Glow Intensity', 'How strong the bloom glow is', 0, 1.2, 0.05, (v) => v.toFixed(2));
-        const proxyRow = text('blProxy', 'BeatLeader Proxy', 'Optional — makes player/level search fast and reliable (see proxy/README.md)', 'your-worker.workers.dev');
+        b.section('Online');
+        const proxyRow = b.text('blProxy', 'BeatLeader Proxy', 'Optional — makes player/level search fast and reliable (see proxy/README.md)', 'your-worker.workers.dev');
         const pin = proxyRow.querySelector('input');
         pin.onchange = () => {
             const v = normalizeProxyUrl(pin.value);

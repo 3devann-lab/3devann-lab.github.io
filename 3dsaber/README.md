@@ -35,7 +35,35 @@ inside the game, with the recorded sabers, head, cuts, misses and score.
   `replay.beatleader.xyz/?scoreId=…`, or a score ID).
 
 The map is downloaded from BeatSaver automatically (the exact version that was played).
-While watching: **Esc / Start** pauses, **C / Y** switches between third-person and the player's first-person view.
+
+### Watching a replay
+
+A control bar appears at the bottom whenever you move the mouse, pause, or hover it:
+
+- **Timeline**: click or drag to jump anywhere. Score, combo, energy, lights, Noodle animations and the notes on screen
+  are rebuilt exactly as they were at that moment. Red/orange marks show misses and bad cuts (bombs and walls too).
+- **Speed**: 0.25x–2x (pitch follows the speed). **Pause** keeps the picture so you can look around.
+- **Cameras**: **First Person** (the player's own head), **Third Person** (the camera you play with), **Follow**
+  (chases the player from behind), **Free** (drag to orbit, right-drag to pan, wheel to zoom, WASD/Q/E to fly, with
+  Stage / Behind / Front / Side / Top presets).
+- **⚙ Options** changes everything live while you watch:
+  - **First person**: field of view, movement and rotation smoothing, level horizon (no head tilt), pull back, raise.
+  - **Follow**: distance, height, smoothing.
+  - **Third person**: field of view, height, distance, tilt.
+  - **Replay**: score HUD, cut scores (`115` or `70 · 15 · 30`), stats panel (per-hand average, pre/acc/post swing,
+    mistakes), hit sounds, player head, saber trail length, timeline marks, skip intro, playback speed.
+
+Everything is remembered for the next replay and can also be set in **Settings**.
+
+| Keyboard | | Controller | |
+|---|---|---|---|
+| Space / K | play / pause | ≡ | pause (cursor works the bar) |
+| ← → (Shift) | back / forward 5 s (15 s) | D-pad ← → | back / forward 5 s |
+| , . | step one frame | D-pad ↑ ↓ | faster / slower |
+| ↑ ↓ | faster / slower | Y / △ | next camera |
+| 1–4, C | camera: first / third / follow / free, next | X / □ | score HUD |
+| H / T / O | score HUD / stats panel / options | sticks | free camera: orbit / fly |
+| R / F | back to start / fullscreen | LT RT, LB RB | free camera: zoom, down / up |
 
 **Players** and **Levels** need BeatLeader's API, which only answers browsers on beatleader.xyz and `localhost`
 dev ports (`npx serve` on port 3000 works for local testing). On your own site, deploy the tiny free worker in
@@ -54,7 +82,9 @@ Without it the game falls back to free public relays, which are often down. Live
 - Full lighting-event playback (lasers, rings, flashes) with bloom post-processing
 - Scoring with combo multiplier (x1–x8), accuracy, ranks (SS–D), per-map high scores
 - Energy bar with fail — or turn on **No Fail** in settings
-- Settings: volumes, saber colors, note speed, cursor sensitivity, graphics quality, bloom toggle
+- Settings: volumes, saber colors, note speed, saber trail length, cursor sensitivity, graphics quality, bloom toggle
+- **Camera**: field of view, height, distance and tilt for the play camera, changeable from the pause menu while
+  playing (the paused picture updates as you drag); separate first-person and follow cameras for replays
 
 ## Performance & stability
 
@@ -70,6 +100,8 @@ Without it the game falls back to free public relays, which are often down. Live
 - `js/main.js` — bootstrap + game loop
 - `js/game.js` — 3D engine, environment, lighting, gameplay, replay playback
 - `js/menu.js` — all UI screens (incl. the replay browser)
+- `js/replayui.js` — replay viewer controls (timeline, speed, cameras, live options)
+- `js/ui.js` — shared UI pieces (toasts, setting rows, camera/replay option lists)
 - `js/beatmap.js` — v2/v3/v4 map parser (Chroma + Noodle)
 - `js/noodle.js` — Noodle/Heck animation + track system
 - `js/beatsaver.js` — BeatSaver API, zip extraction, IndexedDB library

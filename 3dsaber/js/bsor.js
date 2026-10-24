@@ -217,19 +217,25 @@ function roundToInt(v) {
     return f % 2 === 0 ? f : f + 1;
 }
 
-export function cutScore(cut, scoringType) {
+// A good cut's points split the Beat Saber way: pre-swing (70), accuracy (15),
+// post-swing (30). Arcs grant swing parts; chain links are a flat 20.
+export function cutParts(cut, scoringType) {
     const clamp01 = (v) => Math.max(0, Math.min(1, v || 0));
-    const pre = roundToInt(70 * clamp01(cut.beforeCutRating));
-    const post = roundToInt(30 * clamp01(cut.afterCutRating));
+    if (scoringType === 5 || scoringType === 8) return { pre: 0, acc: 0, post: 0, total: 20, fixed: true };
+    let pre = roundToInt(70 * clamp01(cut.beforeCutRating));
+    let post = roundToInt(30 * clamp01(cut.afterCutRating));
     const acc = roundToInt(15 * (1 - clamp01(cut.cutDistanceToCenter / 0.3)));
     switch (scoringType) {
-        case 2: return pre + 30 + acc;          // arc head: post-swing granted
-        case 3: return 70 + post + acc;         // arc tail: pre-swing granted
-        case 4: case 7: return pre + acc;       // chain head (max 85)
-        case 5: case 8: return 20;              // chain link
-        case 6: return 70 + 30 + acc;           // arc head + tail
-        default: return pre + post + acc;       // normal (max 115)
+        case 2: post = 30; break;               // arc head: post-swing granted
+        case 3: pre = 70; break;                // arc tail: pre-swing granted
+        case 4: case 7: post = 0; break;        // chain head (max 85)
+        case 6: pre = 70; post = 30; break;     // arc head + tail
     }
+    return { pre, acc, post, total: pre + acc + post, fixed: false };
+}
+
+export function cutScore(cut, scoringType) {
+    return cutParts(cut, scoringType).total;
 }
 
 export function maxCutScore(scoringType) {

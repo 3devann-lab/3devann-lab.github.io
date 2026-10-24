@@ -7,7 +7,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { DIR_VECTORS, reactionTime } from './beatmap.js';
 import { TrackSystem, UNIT, setUnityRotation, unityQuat, makeFx } from './noodle.js';
-import { NOTE_EVENT, FRAME_STRIDE, splitNoteId, cutScore, maxCutScore } from './bsor.js';
+import { NOTE_EVENT, FRAME_STRIDE, splitNoteId, cutParts, maxCutScore } from './bsor.js';
 import { audio } from './audio.js';
 import { gamepad } from './input.js';
 import { settings } from './settings.js';
@@ -27,15 +27,22 @@ const LAYER_STEP = 0.55;
 const WALL_STEP = UNIT;
 const SPAWN_LEAD_Y = 0.35;
 const SABER_Z = 0.25;           // saber plane in front of the hit point (normal play)
-const CAM_HOME = new THREE.Vector3(0, 1.85, 4.0);
-const CAM_LOOK = new THREE.Vector3(0, 1.15, -8);
+const CAM_MODES = ['first', 'third', 'follow', 'free'];
 const BLADE_LEN = 1.05;
 const DEG = Math.PI / 180;
 const AXIS_Z = new THREE.Vector3(0, 0, 1);
+const UP = new THREE.Vector3(0, 1, 0);
 
 const colX = (c) => (c - 1.5) * COL_STEP;
 const layerY = (l) => LAYER_BASE + l * LAYER_STEP;
 const clamp = THREE.MathUtils.clamp;
+
+// Exponential smoothing factor for this frame. s: 0 = none … 1 = very smooth
+// (half a second to catch up); frame-rate independent.
+function smoothAlpha(s, dt) {
+    const tau = 0.5 * s * s;
+    return tau < 1e-4 ? 1 : 1 - Math.exp(-dt / tau);
+}
 
 function idealScore(n) {
     // max cut = 115; multiplier ramp: 2 hits @x1, 4 @x2, 8 @x4, rest @x8
@@ -391,9 +398,11 @@ export class Engine {
         this.baseFogDensity = 0.028;
 
         this.camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.1, 300);
-        this.camera.position.copy(CAM_HOME);
-        this.camera.lookAt(CAM_LOOK);
-        this.camHomeQuat = this.camera.quaternion.clone();
+        this.camHome = new THREE.Vector3();
+        this.camHomeQuat = new THREE.Quaternion();
+        this.applyCameraSettings();
+        this.camera.position.copy(this.camHome);
+        this.camera.quaternion.copy(this.camHomeQuat);
         this.scene.add(this.camera);
 
         // MSAA happens in the composer's render target (the default framebuffer
@@ -488,6 +497,21 @@ export class Engine {
             emissive: 0xff2020, emissiveIntensity: 0.5, flatShading: true,
         });
         return a;
+    }
+
+    // Play camera from settings: height, distance behind the sabers, tilt, FOV.
+    // A running level picks the change up straight away.
+    applyCameraSettings() {
+        this.camHome.set(0, settings.num('camHeight', 0.3, 5), HIT_Z + settings.num('camDistance', 0.5, 15));
+        this.camHomeQuat.setFromEuler(new THREE.Euler(-settings.num('camTilt', -45, 75) * DEG, 0, 0, 'YXZ'));
+        if (this.gameplay) this.gameplay.onCameraSettings();
+        else this.setFov(settings.num('camFov', 30, 140));
+    }
+
+    setFov(fov) {
+        if (Math.abs(this.camera.fov - fov) < 1e-3) return;
+        this.camera.fov = fov;
+        this.camera.updateProjectionMatrix();
     }
 
     applySize() {
@@ -751,8 +775,9 @@ export class Engine {
             if (Math.random() < 0.22) this.handleEvent({ type: 8, value: 0, float: 1, chroma: null });
         }
         this.camera.position.x = Math.sin(t * 0.11) * 0.35;
-        this.camera.position.y = 1.85 + Math.sin(t * 0.17) * 0.1;
-        this.camera.lookAt(0, 1.4, -12);
+        this.camera.position.y = this.camHome.y + Math.sin(t * 0.17) * 0.1;
+        this.camera.position.z = this.camHome.z;
+        this.camera.lookAt(0, 1.4 + (this.camHome.y - 1.85) * 0.5, -12);
     }
 
     update() {
@@ -871,7 +896,7 @@ class Saber {
 
         // Trail: ring buffer of blade segments, limited by AGE (not frame
         // count) so it looks the same at 30 fps as at 144 fps
-        this.trailLen = 24;
+        this.trailLen = 48;
         this.trailMaxAge = 0.12;
         this.trailTips = Array.from({ length: this.trailLen }, () => new THREE.Vector3());
         this.trailBases = Array.from({ length: this.trailLen }, () => new THREE.Vector3());
@@ -890,6 +915,18 @@ class Saber {
         this.scene = parent;
         while (this.scene.parent) this.scene = this.scene.parent;
         this.scene.add(this.trailMesh);
+        this.setTrailLength(settings.num('trailLength', 0, 0.4));
+    }
+
+    setTrailLength(sec) {
+        this.trailMaxAge = sec;
+        this.trailMesh.visible = sec > 0.005;
+    }
+
+    // forget the trail (after a replay jumps in time)
+    resetTrail() {
+        this.trailCount = 0;
+        this.hasPrev = false;
     }
 
     // stick: {x: -1..1, y: -1..1 (down positive)}
@@ -938,6 +975,7 @@ class Saber {
     }
 
     pushTrail() {
+        if (!this.trailMesh.visible) return;
         const now = performance.now() / 1000;
         this.trailHead = (this.trailHead + this.trailLen - 1) % this.trailLen;
         this.trailTips[this.trailHead].copy(this.tip);
@@ -1047,6 +1085,28 @@ class ReplayPose {
     }
 }
 
+// Free-camera starting points (orbit target is near the player's head)
+const FREE_PRESETS = {
+    stage:  { tx: 0, ty: 1.2, tz: 0, yaw: 0.6, pitch: 0.25, dist: 4.5 },
+    behind: { tx: 0, ty: 1.3, tz: 0, yaw: 0, pitch: 0.15, dist: 3.2 },
+    front:  { tx: 0, ty: 1.3, tz: 0, yaw: Math.PI, pitch: 0.12, dist: 3.6 },
+    side:   { tx: 0, ty: 1.2, tz: -0.4, yaw: Math.PI / 2, pitch: 0.08, dist: 3.8 },
+    top:    { tx: 0, ty: 1.0, tz: -1.5, yaw: 0, pitch: 1.3, dist: 6.5 },
+};
+export const FREE_PRESET_NAMES = Object.keys(FREE_PRESETS);
+
+function validFreeCam(fc) {
+    if (!fc || typeof fc !== 'object') return null;
+    for (const k of ['tx', 'ty', 'tz', 'yaw', 'pitch', 'dist']) if (!Number.isFinite(fc[k])) return null;
+    return { ...fc, pitch: clamp(fc.pitch, -1.45, 1.45), dist: clamp(fc.dist, 0.3, 40) };
+}
+
+// point a camera at `target`, both in its parent's space
+function lookAtLocal(obj, target) {
+    _m4.lookAt(obj.position, target, UP);
+    obj.quaternion.setFromRotationMatrix(_m4);
+}
+
 function median(arr, fallback) {
     if (!arr.length) return fallback;
     const s = [...arr].sort((a, b) => a - b);
@@ -1055,6 +1115,7 @@ function median(arr, fallback) {
 
 // ---------- Gameplay session ----------
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _q = new THREE.Quaternion(), _m4 = new THREE.Matrix4();
+const _e = new THREE.Euler(0, 0, 0, 'YXZ');
 const _swing = new THREE.Vector2();
 
 export class Gameplay {
@@ -1104,10 +1165,12 @@ export class Gameplay {
         this.scene.add(this.playerRig);
         const cam = engine.camera;
         this.headRig.add(cam);
-        this.camLocalHome = new THREE.Vector3(CAM_HOME.x, CAM_HOME.y, CAM_HOME.z - HIT_Z);
+        this.camLocalHome = new THREE.Vector3().copy(engine.camHome);
+        this.camLocalHome.z -= HIT_Z;
         cam.position.copy(this.camLocalHome);
         cam.quaternion.copy(engine.camHomeQuat);
         this.camMode = 'third';
+        engine.setFov(settings.num('camFov', 30, 140));
 
         this.saberLeft = new Saber(this.leftHandRig, settings.get('leftColor'), -0.55);
         this.saberRight = new Saber(this.rightHandRig, settings.get('rightColor'), 0.55);
@@ -1143,16 +1206,7 @@ export class Gameplay {
         this.liveBombs = [];
         this.liveWalls = [];
 
-        this.score = 0;
-        this.combo = 0;
-        this.maxCombo = 0;
-        this.multiplier = 1;
-        this.multProgress = 0;
-        this.hits = 0;
-        this.misses = 0;
-        this.processed = 0;
-        this.maxScore = 0;           // replay: max possible so far (Beat Saber rules)
-        this.energy = 0.5;
+        this.resetScore();
         this.failed = false;
         this.finished = false;
         this.paused = false;
@@ -1168,15 +1222,22 @@ export class Gameplay {
             tag.classList.toggle('hidden', !this.replay);
             if (this.replay) tag.textContent = `REPLAY · ${this.replay.playerName || this.replay.data.info.playerName || 'Player'}`;
         }
+        this.applyReplaySettings();
         this.updateHud();
 
         let startAt = -2.2;
         let rate = 1;
+        this.playback = 1;           // replay viewer speed (on top of the replay's own modifiers)
         if (this.replay) {
             this.setupReplay();
             rate = this.replay.speed || 1;
             const st = this.replay.data.info.startTime || 0;
             if (st > 0.5) startAt = st - 1.0;
+            // long intros: start shortly before the first thing happens
+            const first = this.replayState.timeline.length ? this.replayState.timeline[0].time : 0;
+            if (settings.get('replaySkipIntro') && first - 2.5 > Math.max(startAt, 0)) startAt = first - 2.5;
+            this.replayStartAt = startAt;
+            this.setCameraMode(settings.get('replayCamera'));
         }
         audio.onSongEnd = () => { if (!this.failed) this.finish(); };
         audio.startSong(songBuffer, startAt, rate);
@@ -1521,15 +1582,25 @@ export class Gameplay {
         return m;
     }
 
+    // NE size[2] overrides duration-based length (grid units)
+    wallLength(w) {
+        return w.l != null
+            ? Math.min(300, Math.max(0.05, Math.abs(w.l) * UNIT))
+            : Math.min(300, Math.max(0.05, w.duration * this.noteSpeed(w)));
+    }
+
+    // a wall leaves once its lifetime is over and its back end is behind the player
+    wallGone(w, t, rt, speed, length) {
+        const lifeP = clamp((t - (w.time - rt)) / (rt * 2 + w.duration), 0, 1);
+        return lifeP >= 1 && -(w.time - t) * speed - length > 3;
+    }
+
     spawnWall(w) {
         const A = this.engine.assets;
         // Wall art uses huge/tiny/negative sizes — preserve them, just keep sane bounds
         const width = Math.min(60, Math.max(0.03, Math.abs(w.w))) * COL_STEP;
         const height = Math.min(60, Math.max(0.03, Math.abs(w.h))) * WALL_STEP;
-        // NE size[2] overrides duration-based length (grid units)
-        const length = w.l != null
-            ? Math.min(300, Math.max(0.05, Math.abs(w.l) * UNIT))
-            : Math.min(300, Math.max(0.05, w.duration * this.noteSpeed(w)));
+        const length = this.wallLength(w);
         const color = new THREE.Color(0xff2d55);
         if (w.chroma) tameColor(color, w.chroma);
         const own = this.needsOwnMaterial(w);
@@ -1560,14 +1631,21 @@ export class Gameplay {
 
     // ----- game update -----
     update(dt) {
-        if (this.paused || this.finished) return;
+        if (this.finished) return;
+        if (this.paused) {                    // the free camera still moves while paused
+            if (this.replay) this.updateReplayCamera(dt);
+            return;
+        }
+        this.step(audio.songTime, dt);
+    }
 
-        const t = audio.songTime;
+    step(t, dt) {
+        this.lastT = t;
 
         // countdown display
         const cd = this.$('countdown');
         if (t < 0) {
-            const n = Math.ceil(-t / (this.replay ? (this.replay.speed || 1) : 1));
+            const n = Math.ceil(-t / (audio.songRate || 1));
             const label = n > 3 ? 'READY' : String(n);
             if (cd.textContent !== label) {
                 cd.textContent = label;
@@ -1586,8 +1664,10 @@ export class Gameplay {
         }
 
         // sabers (gamepad is polled once per frame by the main loop)
-        if (this.replay) this.updateReplayPose(t);
-        else {
+        if (this.replay) {
+            this.updateReplayPose(t);
+            this.updateReplayCamera(dt);
+        } else {
             this.saberLeft.move(gamepad.leftStick, dt);
             this.saberRight.move(gamepad.rightStick, dt);
         }
@@ -1915,10 +1995,13 @@ export class Gameplay {
 
     bombHit(m, i) {
         const ud = m.userData;
-        this.combo = 0;
-        if (this.replay) this.dropMultiplier(); else { this.multiplier = 1; this.multProgress = 0; }
-        this.addEnergy(this.replay ? -0.15 : -0.13);
-        audio.playSfx('miss', 0.9, 0.7);
+        if (this.replay) this.scoreReplayBomb();
+        else {
+            this.combo = 0;
+            this.multiplier = 1; this.multProgress = 0;
+            this.addEnergy(-0.13);
+        }
+        if (!this.replay || this.ro.hitSounds) audio.playSfx('miss', 0.9, 0.7);
         if (!this.replay) gamepad.rumble(220, 1, 1);
         this.showJudgement('BOMB!', '#ff2d2d');
         this.engine.particles.burst(ud.wp, _bombColor, 26);
@@ -1963,7 +2046,7 @@ export class Gameplay {
                 }
             }
 
-            if (lifeP >= 1 && headZ - ud.length > 3) {
+            if (this.wallGone(w, t, ud.rt, ud.speed, ud.length)) {
                 this.removeObj(m);
                 this.liveWalls.splice(i, 1);
             }
@@ -2016,35 +2099,313 @@ export class Gameplay {
             dy: clamp(median(dys, 0.1), -0.6, 0.6),
             dz: clamp(median(dzs, 0.77), -0.5, 2),
         };
+        // Everything that changes the score, in time order: seeking replays
+        // it to rebuild score, combo and energy at any moment instantly.
+        const walls = [...(rp.data.walls || [])].sort((a, b) => a.time - b.time);
+        const timeline = [];
+        for (const [n, ev] of rp.match.noteEvents) timeline.push({ time: ev.eventTime, kind: 0, ev, color: n.color });
+        if (!(rp.mods || []).includes('NB')) {
+            for (const ev of rp.match.bombEvents.values()) timeline.push({ time: ev.eventTime, kind: 1, ev });
+        }
+        for (const ev of walls) timeline.push({ time: ev.time, kind: 2, ev });
+        timeline.sort((a, b) => a.time - b.time);
         this.replayState = {
             pose: new ReplayPose(rp.data.frames, calib),
-            walls: [...(rp.data.walls || [])].sort((a, b) => a.time - b.time),
+            walls,
             wallIdx: 0,
             failTime: info.failTime > 0 ? info.failTime : 0,
             calib,
+            timeline,
         };
+        this.resetScore();
 
-        // visible head for the third-person view
+        // visible head for the outside views
         const visor = new THREE.Mesh(this.engine.assets.head, new THREE.MeshStandardMaterial({
             color: 0x1a1a28, emissive: 0x7c5cff, emissiveIntensity: 0.6, roughness: 0.4,
         }));
         this.headModel = visor;
         this.playerRig.add(visor);
+        this.freeCam = validFreeCam(settings.get('freeCam')) || { ...FREE_PRESETS.stage };
     }
 
-    setCameraMode(mode) {
-        this.camMode = mode;
-        if (mode === 'third') {
-            this.engine.camera.position.copy(this.camLocalHome);
-            this.engine.camera.quaternion.copy(this.engine.camHomeQuat);
+    // Moments worth marking on the replay timeline
+    replayMarkers() {
+        const out = [];
+        for (const e of this.replayState.timeline) {
+            if (e.kind === 0 && e.ev.eventType === NOTE_EVENT.GOOD) continue;
+            out.push({ time: e.time, type: e.kind === 1 ? 'bomb' : e.kind === 2 ? 'wall' : e.ev.eventType === NOTE_EVENT.BAD ? 'bad' : 'miss' });
         }
-        if (this.headModel) this.headModel.visible = mode !== 'first';
+        return out;
+    }
+
+    // last moment the replay can show (the song end, or where the player failed)
+    get replayEnd() {
+        const st = this.replayState;
+        return st && st.failTime ? st.failTime : (audio.songDuration || 0);
+    }
+
+    resetScore() {
+        this.score = 0;
+        this.combo = 0;
+        this.maxCombo = 0;
+        this.multiplier = 1;
+        this.multProgress = 0;
+        this.hits = 0;
+        this.misses = 0;
+        this.processed = 0;
+        this.maxScore = 0;           // replay: max possible so far (Beat Saber rules)
+        this.energy = 0.5;
+        this.stats = {               // replay stats overlay
+            hand: [{ n: 0, sum: 0 }, { n: 0, sum: 0 }],   // left (red), right (blue)
+            pre: 0, preN: 0, acc: 0, accN: 0, post: 0, postN: 0,
+            misses: 0, badCuts: 0, bombs: 0, walls: 0,
+            last: null,
+        };
+    }
+
+    // One recorded note event → score. Returns the cut's parts, or null for a miss / bad cut.
+    scoreReplayNote(ev, color) {
+        const { scoringType: st } = splitNoteId(ev.noteID);
+        const S = this.stats;
+        this.processed++;
+        this.maxScore += maxCutScore(st) * idealMult(this.processed);
+        if (ev.eventType === NOTE_EVENT.GOOD && ev.cut) {
+            this.bumpMultiplierBS();
+            const p = cutParts(ev.cut, st);
+            this.score += p.total * this.multiplier;
+            this.combo++; this.hits++;
+            this.maxCombo = Math.max(this.maxCombo, this.combo);
+            this.addEnergy(0.01);
+            const h = S.hand[color === 0 ? 0 : 1];
+            h.n++; h.sum += p.total;
+            if (!p.fixed) {
+                S.acc += p.acc; S.accN++;
+                if (st !== 3 && st !== 6) { S.pre += p.pre; S.preN++; }
+                if (st !== 2 && st !== 4 && st !== 6 && st !== 7) { S.post += p.post; S.postN++; }
+            }
+            S.last = p;
+            return p;
+        }
+        const bad = ev.eventType === NOTE_EVENT.BAD;
+        this.combo = 0; this.misses++;
+        if (bad) S.badCuts++; else S.misses++;
+        this.dropMultiplier();
+        this.addEnergy(bad ? -0.1 : -0.15);
+        return null;
+    }
+
+    scoreReplayBomb() {
+        this.combo = 0;
+        this.dropMultiplier();
+        this.addEnergy(-0.15);
+        this.stats.bombs++;
+    }
+
+    scoreReplayWall(ev) {
+        this.combo = 0;
+        this.dropMultiplier();
+        if (Number.isFinite(ev.energy)) this.energy = clamp(ev.energy, 0, 1);
+        this.stats.walls++;
+    }
+
+    // Jump the replay to song time `target`. Score, lights, Noodle animation
+    // and every object on screen are rebuilt as they'd be at that moment.
+    seek(target) {
+        if (!this.replay || this.finished) return;
+        const st = this.replayState;
+        target = clamp(target, Math.min(this.replayStartAt, 0), Math.max(0, this.replayEnd - 0.05));
+
+        for (const g of this.liveNotes) this.removeObj(g);
+        for (const m of this.liveBombs) this.removeObj(m);
+        for (const m of this.liveWalls) this.removeObj(m);
+        this.liveNotes = []; this.liveBombs = []; this.liveWalls = [];
+        this.engine.particles.clear();
+        this.engine.slices.clear();
+        this.saberLeft.resetTrail();
+        this.saberRight.resetTrail();
+
+        this.resetScore();
+        for (const e of st.timeline) {
+            if (e.time > target) break;
+            if (e.kind === 0) this.scoreReplayNote(e.ev, e.color);
+            else if (e.kind === 1) this.scoreReplayBomb();
+            else this.scoreReplayWall(e.ev);
+        }
+        st.wallIdx = 0;
+        while (st.wallIdx < st.walls.length && st.walls[st.wallIdx].time <= target) st.wallIdx++;
+
+        // lights and Noodle tracks: from the start, up to the target
+        this.engine.resetLights();
+        if (this.map.environment && this.map.environment.hideGroups) this.engine.hideDecor(this.map.environment.hideGroups);
+        const evs = this.map.events;
+        this.eventIdx = 0;
+        while (this.eventIdx < evs.length && evs[this.eventIdx].time <= target) this.engine.handleEvent(evs[this.eventIdx++]);
+        this.tracks.reset();
+        this.tracks.update(target);
+
+        // respawn what is on screen at the target (spawned, not yet resolved or gone)
+        const M = this.replay.match;
+        const respawn = (queue, spawn, alive) => {
+            let i = 0;
+            for (; i < queue.length && queue[i].at <= target; i++) if (alive(queue[i].o)) spawn.call(this, queue[i].o);
+            return i;
+        };
+        const aliveNote = (events) => (o) => {
+            const ev = events.get(o);
+            return ev ? ev.eventTime > target : target - o.time <= 2.5 * this.noteRt(o);
+        };
+        this.noteIdx = respawn(this.noteQueue, this.spawnNote, aliveNote(M.noteEvents));
+        this.bombIdx = respawn(this.bombQueue, this.spawnBomb, aliveNote(M.bombEvents));
+        this.wallIdx = respawn(this.wallQueue, this.spawnWall, (w) => !this.wallGone(w, target, this.noteRt(w), this.noteSpeed(w), this.wallLength(w)));
+
+        audio.seek(target);
+        this._camSnap = true;
+        this._hud.prog = -1;
+        this.updateHud();
+        if (this.paused) this.step(target, 0);       // show the new moment while paused
+    }
+
+    // Replay viewer speed (pitch follows, like a tape)
+    setPlayback(mult) {
+        if (!this.replay) return;
+        this.playback = clamp(mult, 0.1, 4);
+        audio.setRate((this.replay.speed || 1) * this.playback);
+    }
+
+    // ----- cameras -----
+    // third: the play camera · first: the player's head · follow: chases the
+    // head from behind · free: orbit anywhere with mouse / sticks
+    setCameraMode(mode) {
+        if (!this.replay || !CAM_MODES.includes(mode)) mode = 'third';
+        this.camMode = mode;
+        this._camSnap = true;
+        const cam = this.engine.camera;
+        if (mode === 'third') {
+            cam.position.copy(this.camLocalHome);
+            cam.quaternion.copy(this.engine.camHomeQuat);
+        }
+        this.engine.setFov(settings.num(mode === 'first' ? 'fpFov' : 'camFov', 30, 140));
+        if (this.headModel) this.headModel.visible = mode !== 'first' && settings.get('replayHead') !== false;
+        return mode;
     }
 
     toggleCamera() {
-        if (!this.replay) return;
-        this.setCameraMode(this.camMode === 'third' ? 'first' : 'third');
-        return this.camMode;
+        if (!this.replay) return this.camMode;
+        return this.setCameraMode(CAM_MODES[(CAM_MODES.indexOf(this.camMode) + 1) % CAM_MODES.length]);
+    }
+
+    // camera / replay settings changed (Settings screen or the live replay panel)
+    onCameraSettings() {
+        this.camLocalHome.copy(this.engine.camHome);
+        this.camLocalHome.z -= HIT_Z;
+        this.applyReplaySettings();
+        this.setCameraMode(this.camMode);
+    }
+
+    applyReplaySettings() {
+        this.ro = {
+            hitSounds: settings.get('replayHitSounds') !== false,
+            cutText: settings.get('replayCutText') || 'total',
+            stats: !!this.replay && !!settings.get('replayStats'),
+        };
+        const trail = settings.num('trailLength', 0, 0.4);
+        this.saberLeft.setTrailLength(trail);
+        this.saberRight.setTrailLength(trail);
+        if (this.headModel) this.headModel.visible = this.camMode !== 'first' && settings.get('replayHead') !== false;
+        this.$('hud').classList.toggle('hud-off', !!this.replay && settings.get('replayHud') === false);
+        const sp = this.$('replay-stats');
+        if (sp) sp.classList.toggle('hidden', !this.ro.stats);
+        this._statsHtml = null;
+        this.updateStats();
+    }
+
+    updateReplayCamera(dt) {
+        const mode = this.camMode;
+        if (mode === 'third' || !this.replayState) return;
+        const cam = this.engine.camera;
+        const P = this.replayState.pose;
+        const snap = this._camSnap || !(dt > 0);
+        this._camSnap = false;
+        if (mode === 'first') {
+            _q.copy(P.head.quat);
+            if (settings.get('fpLevelHorizon')) {
+                _e.setFromQuaternion(_q, 'YXZ');
+                _e.z = 0;
+                _q.setFromEuler(_e);
+            }
+            _v.copy(P.head.pos);
+            const back = settings.num('fpOffsetBack', -1, 5);
+            if (back) {      // pull back along the horizontal look direction
+                _v2.set(0, 0, -1).applyQuaternion(_q);
+                _v2.y = 0;
+                if (_v2.lengthSq() < 1e-6) _v2.set(0, 0, -1); else _v2.normalize();
+                _v.addScaledVector(_v2, -back);
+            }
+            _v.y += settings.num('fpOffsetUp', -2, 2);
+            if (snap) {
+                cam.position.copy(_v);
+                cam.quaternion.copy(_q);
+            } else {
+                cam.position.lerp(_v, smoothAlpha(settings.num('fpPosSmooth', 0, 1), dt));
+                cam.quaternion.slerp(_q, smoothAlpha(settings.num('fpRotSmooth', 0, 1), dt));
+            }
+        } else if (mode === 'follow') {
+            const f = this._follow || (this._follow = new THREE.Vector3());
+            if (snap) f.copy(P.head.pos);
+            else f.lerp(P.head.pos, smoothAlpha(settings.num('followSmooth', 0, 1), dt));
+            cam.position.set(f.x, f.y + settings.num('followHeight', -1, 4), f.z + settings.num('followDistance', 0.2, 10));
+            lookAtLocal(cam, _v.set(f.x * 0.5, f.y - 0.25, f.z - 6));   // down the lane, toward the notes
+        } else {
+            const fc = this.freeCam;
+            const cp = Math.cos(fc.pitch);
+            cam.position.set(
+                fc.tx + Math.sin(fc.yaw) * cp * fc.dist,
+                fc.ty + Math.sin(fc.pitch) * fc.dist,
+                fc.tz + Math.cos(fc.yaw) * cp * fc.dist);
+            lookAtLocal(cam, _v.set(fc.tx, fc.ty, fc.tz));
+        }
+    }
+
+    // free camera controls (radians / metres, in the camera's own frame)
+    freeCamOrbit(dYaw, dPitch) {
+        const fc = this.freeCam;
+        if (!fc) return;
+        fc.yaw = (fc.yaw + dYaw) % (Math.PI * 2);
+        fc.pitch = clamp(fc.pitch + dPitch, -1.45, 1.45);
+        this.freeCamDirty = true;
+    }
+
+    freeCamZoom(factor) {
+        const fc = this.freeCam;
+        if (!fc) return;
+        fc.dist = clamp(fc.dist * factor, 0.3, 40);
+        this.freeCamDirty = true;
+    }
+
+    // right / up / forward, relative to where the camera faces
+    freeCamMove(right, up, forward) {
+        const fc = this.freeCam;
+        if (!fc) return;
+        const s = Math.sin(fc.yaw), c = Math.cos(fc.yaw);
+        fc.tx = clamp(fc.tx + c * right - s * forward, -60, 60);
+        fc.ty = clamp(fc.ty + up, -20, 40);
+        fc.tz = clamp(fc.tz - s * right - c * forward, -120, 60);
+        this.freeCamDirty = true;
+    }
+
+    freeCamPreset(name) {
+        if (!FREE_PRESETS[name]) return;
+        this.freeCam = { ...FREE_PRESETS[name] };
+        this.freeCamDirty = true;
+        if (this.camMode !== 'free') this.setCameraMode('free');
+    }
+
+    saveFreeCam() {
+        if (!this.freeCamDirty || !this.freeCam) return;
+        this.freeCamDirty = false;
+        const r = (v) => Math.round(v * 1000) / 1000;
+        const fc = this.freeCam;
+        settings.set('freeCam', { tx: r(fc.tx), ty: r(fc.ty), tz: r(fc.tz), yaw: r(fc.yaw), pitch: r(fc.pitch), dist: r(fc.dist) });
     }
 
     updateReplayPose(t) {
@@ -2056,12 +2417,6 @@ export class Gameplay {
         if (this.headModel) {
             this.headModel.position.copy(P.head.pos);
             this.headModel.quaternion.copy(P.head.quat);
-        }
-        if (this.camMode === 'first') {
-            const cam = this.engine.camera;
-            // light smoothing so recorded head jitter doesn't shake the view
-            cam.position.lerp(P.head.pos, 0.6);
-            cam.quaternion.slerp(P.head.quat, 0.5);
         }
     }
 
@@ -2086,34 +2441,31 @@ export class Gameplay {
         }
         if (!due.length) return;
         due.sort((a, b) => a.userData.rev.eventTime - b.userData.rev.eventTime);
+        const sounds = this.ro.hitSounds;
         for (const g of due) {
             const ev = g.userData.rev;
-            const { scoringType } = splitNoteId(ev.noteID);
-            this.processed++;
-            this.maxScore += maxCutScore(scoringType) * idealMult(this.processed);
-            if (ev.eventType === NOTE_EVENT.GOOD && ev.cut) {
-                this.bumpMultiplierBS();
-                const pts = cutScore(ev.cut, scoringType);
-                this.score += pts * this.multiplier;
-                this.combo++; this.hits++;
-                this.maxCombo = Math.max(this.maxCombo, this.combo);
-                this.addEnergy(0.01);
-                audio.playHit(pts >= 110 ? 1.0 : 0.85);
-                this.showJudgement(String(pts), pts >= 115 ? '#ffd76a' : pts >= 108 ? '#ffffff' : pts >= 100 ? '#9fd8ff' : '#ffb27a');
+            const p = this.scoreReplayNote(ev, g.userData.note.color);
+            if (p) {
+                if (sounds) audio.playHit(p.total >= 110 ? 1.0 : 0.85);
+                this.showCutScore(p);
                 const sd = ev.cut.saberDir;
                 this.cutEffects(g, _swing.set(sd[0], sd[1]));
             } else {
                 const bad = ev.eventType === NOTE_EVENT.BAD;
-                this.combo = 0; this.misses++;
-                this.dropMultiplier();
-                this.addEnergy(bad ? -0.1 : -0.15);
-                audio.playSfx('miss', 0.55);
+                if (sounds) audio.playSfx('miss', 0.55);
                 this.showJudgement(bad ? 'BAD CUT' : 'MISS', '#ff5a5a');
             }
             this.removeObj(g);
             this.liveNotes.splice(this.liveNotes.indexOf(g), 1);
-            this.updateHud(ev.eventType === NOTE_EVENT.GOOD);
+            this.updateHud(!!p);
         }
+    }
+
+    showCutScore(p) {
+        const mode = this.ro.cutText;
+        if (mode === 'off') return;
+        const color = p.total >= 115 ? '#ffd76a' : p.total >= 108 ? '#ffffff' : p.total >= 100 ? '#9fd8ff' : '#ffb27a';
+        this.showJudgement(String(p.total), color, mode === 'split' && !p.fixed ? `${p.pre} · ${p.acc} · ${p.post}` : '');
     }
 
     // Beat Saber's multiplier: progress counts first, the note scores at the new value
@@ -2129,10 +2481,7 @@ export class Gameplay {
     updateReplayEvents(t) {
         const st = this.replayState;
         while (st.wallIdx < st.walls.length && st.walls[st.wallIdx].time <= t) {
-            const ev = st.walls[st.wallIdx++];
-            this.combo = 0;
-            this.dropMultiplier();
-            if (Number.isFinite(ev.energy)) this.energy = clamp(ev.energy, 0, 1);
+            this.scoreReplayWall(st.walls[st.wallIdx++]);
             this.showJudgement('WALL', '#ff8a5a');
             this.updateHud();
         }
@@ -2143,9 +2492,34 @@ export class Gameplay {
         }
     }
 
-    showJudgement(text, color = '') {
+    // live per-hand accuracy overlay (replays)
+    updateStats() {
+        if (!this.ro || !this.ro.stats) return;
+        const S = this.stats;
+        const avg = (sum, n) => (n ? (sum / n).toFixed(1) : '—');
+        const last = S.last;
+        const html =
+            `<div class="rs-hands"><div class="rs-hand left"><span>L</span><b>${avg(S.hand[0].sum, S.hand[0].n)}</b></div>` +
+            `<div class="rs-hand right"><span>R</span><b>${avg(S.hand[1].sum, S.hand[1].n)}</b></div></div>` +
+            `<div class="rs-parts"><span>Pre <b>${avg(S.pre, S.preN)}</b></span><span>Acc <b>${avg(S.acc, S.accN)}</b></span><span>Post <b>${avg(S.post, S.postN)}</b></span></div>` +
+            `<div class="rs-errors"><span class="${S.misses ? 'bad' : ''}">${S.misses} miss</span><span class="${S.badCuts ? 'bad' : ''}">${S.badCuts} bad</span>` +
+            `<span class="${S.bombs ? 'bad' : ''}">${S.bombs} bomb</span><span class="${S.walls ? 'bad' : ''}">${S.walls} wall</span></div>` +
+            `<div class="rs-last"><span>Last <b>${last ? last.total : '—'}</b>${last && !last.fixed ? ` <small>${last.pre}·${last.acc}·${last.post}</small>` : ''}</span>` +
+            `<span>Max combo <b>${this.maxCombo}</b></span></div>`;
+        if (html === this._statsHtml) return;
+        this._statsHtml = html;
+        const el = this.$('replay-stats');
+        if (el) el.innerHTML = html;
+    }
+
+    showJudgement(text, color = '', sub = '') {
         const el = this.$('hud-judgement');
         el.textContent = text;
+        if (sub) {
+            const s = document.createElement('small');
+            s.textContent = sub;
+            el.appendChild(s);
+        }
         el.style.color = color || (text === 'PERFECT' ? '#ffd76a' : '#cfd6ff');
         el.classList.remove('show');
         void el.offsetWidth;
@@ -2186,6 +2560,7 @@ export class Gameplay {
         this._set('hud-energy-fill', 'energy', `scaleY(${this.energy.toFixed(3)})`, 'transform');
         const low = this.energy < 0.25;
         if (this._hud.low !== low) { this._hud.low = low; this.$('hud-energy-fill').classList.toggle('low', low); }
+        if (this.replay) this.updateStats();
         if (comboPulse) {
             const c = this.$('hud-combo');
             c.classList.remove('pulse'); void c.offsetWidth; c.classList.add('pulse');
@@ -2241,11 +2616,16 @@ export class Gameplay {
         if (this.headModel) { this.headModel.removeFromParent(); this.headModel.material.dispose(); }
 
         // restore camera from the head rig
+        if (this.replay) this.saveFreeCam();
         const cam = this.engine.camera;
         cam.removeFromParent();
         this.scene.add(cam);
-        cam.position.copy(CAM_HOME);
+        cam.position.copy(this.engine.camHome);
         cam.quaternion.copy(this.engine.camHomeQuat);
+        this.engine.setFov(settings.num('camFov', 30, 140));
+        this.$('hud').classList.remove('hud-off');
+        const sp = this.$('replay-stats');
+        if (sp) sp.classList.add('hidden');
 
         this.tracks.destroy();
         this.scene.remove(this.playerRig);

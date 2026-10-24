@@ -7,7 +7,12 @@ const DEADZONE = 0.14;
 export const Buttons = {
     CONFIRM: 0,
     BACK: 1,
+    X: 2,
     Y: 3,
+    LB: 4,
+    RB: 5,
+    LT: 6,
+    RT: 7,
     START: 9,
     DPAD_UP: 12,
     DPAD_DOWN: 13,
@@ -27,6 +32,7 @@ class GamepadManager {
         this.isPlayStation = false;
         this.prev = [];
         this.curr = [];
+        this.values = [];        // analog button values (triggers)
         this.axes = [0, 0, 0, 0];
         this.listeners = { connect: [], disconnect: [] };
 
@@ -52,15 +58,18 @@ class GamepadManager {
     poll() {
         this.prev = this.curr;
         this.curr = [];
+        this.values = [];
         if (this.index === null) return;
         const gp = navigator.getGamepads()[this.index];
         if (!gp) return;
         this.curr = gp.buttons.map(b => b.pressed);
+        this.values = gp.buttons.map(b => b.value || (b.pressed ? 1 : 0));
         this.axes = [dz(gp.axes[0] || 0), dz(gp.axes[1] || 0), dz(gp.axes[2] || 0), dz(gp.axes[3] || 0)];
     }
 
     down(i) { return !!this.curr[i]; }
     justPressed(i) { return !!this.curr[i] && !this.prev[i]; }
+    trigger(i) { return this.values[i] || 0; }
 
     // Raw (un-deadzoned) axes for saber control, with deadzone applied per-axis
     get leftStick() { return { x: this.axes[0], y: this.axes[1] }; }
