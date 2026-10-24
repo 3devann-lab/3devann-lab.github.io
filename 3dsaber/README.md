@@ -27,6 +27,8 @@ Then open the printed URL in **Chrome or Edge** (best audio codec support for cu
 **Replays** on the main menu plays back real Beat Saber runs from [BeatLeader](https://beatleader.xyz)
 inside the game, with the recorded sabers, head, cuts, misses and score.
 
+- **● Live** — every replay set on BeatLeader shows up the moment it's set. Type a username or song to filter
+  (e.g. wait for a friend's next score). Works on any site, no setup.
 - **Players** — search a username, open their scores, search their levels, sort by recent / top PP / accuracy, hit **Watch**.
 - **Levels** — search a song or mapper, pick a difficulty, watch any score on its leaderboard.
 - **File / Link** — drop a `.bsor` file or paste a replay link (`cdn.replays.beatleader.xyz/….bsor`,
@@ -35,10 +37,10 @@ inside the game, with the recorded sabers, head, cuts, misses and score.
 The map is downloaded from BeatSaver automatically (the exact version that was played).
 While watching: **Esc / Start** pauses, **C / Y** switches between third-person and the player's first-person view.
 
-BeatLeader's API only answers browsers on beatleader.xyz, so player/level search goes through a CORS
-proxy. Public ones are tried automatically; for reliable search deploy the tiny worker in
-[`proxy/`](proxy/README.md) and paste its URL into **Settings → BeatLeader Proxy**.
-Replay files and links work without it.
+**Players** and **Levels** need BeatLeader's API, which only answers browsers on beatleader.xyz and `localhost`
+dev ports (`npx serve` on port 3000 works for local testing). On your own site, deploy the tiny free worker in
+[`proxy/`](proxy/README.md) and paste its URL into **Settings → BeatLeader Proxy** (press **Test** to check it).
+Without it the game falls back to free public relays, which are often down. Live and File / Link never need it.
 
 ## Features
 

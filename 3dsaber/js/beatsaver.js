@@ -26,6 +26,23 @@ export async function getMapByHash(hash) {
     return meta;
 }
 
+// Can a map be downloaded? Official (OST/DLC) levels have no BeatSaver hash and
+// people often play unpublished test maps, so replays of those can't be watched.
+const availability = new Map();   // hash -> Promise<boolean>
+export function isDownloadableHash(hash) {
+    return /^[0-9a-f]{40}$/i.test(String(hash || ''));
+}
+export function mapAvailable(hash) {
+    const h = String(hash || '').toLowerCase();
+    if (!isDownloadableHash(h)) return Promise.resolve(false);
+    if (!availability.has(h)) {
+        availability.set(h, fetch(`${API}/maps/hash/${h}`)
+            .then(res => res.status !== 404)          // other errors: don't block the button
+            .catch(() => true));
+    }
+    return availability.get(h);
+}
+
 export async function searchMaps({ query = '', page = 0, sort = 'Relevance' } = {}) {
     let url;
     if (query.trim()) {

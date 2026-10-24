@@ -4,7 +4,7 @@ import { gamepad, cursor } from './input.js';
 import { settings, getHighScore, setHighScore, getBestScores } from './settings.js';
 import {
     searchMaps, downloadMap, getSavedMaps, getSavedMap, deleteSavedMap,
-    getSavedIds, findSavedByHash, getMapByHash,
+    getSavedIds, findSavedByHash, getMapByHash, mapAvailable, isDownloadableHash,
 } from './beatsaver.js';
 import { parseDifficulty } from './beatmap.js';
 import { generateBuiltinBeatmap, BUILTIN_SONG } from './builtin.js';
@@ -13,6 +13,7 @@ import { decodeBsor, matchReplay, replaySpeed, replayModifiers } from './bsor.js
 import {
     searchPlayers, getPlayerScores, searchLevels, getLeaderboard, getReplayUrl,
     getScoreById, fetchReplay, parseReplayLink, countryFlag,
+    BeatLeaderUnreachable, liveScores, scoreMatches, testProxy, normalizeProxyUrl,
 } from './beatleader.js';
 
 const $ = (id) => document.getElementById(id);
@@ -61,9 +62,11 @@ export class Menu {
         this.audioCache = null;     // { id, buffer } — last decoded song (retries are instant)
         this.browseState = { query: '', sort: 'Rating', page: 0 };
         this.replayUi = {
-            tab: 'players', playerQuery: '', players: null, player: null,
+            // without a proxy, search depends on flaky public relays; the live feed always works
+            tab: settings.get('blProxy') ? 'players' : 'live', playerQuery: '', players: null, player: null,
             scoreQuery: '', scoreSort: 'date', scorePage: 1,
             levelQuery: '', levels: null, level: null, lb: null, lbPage: 1,
+            liveFilter: '',
         };
         this.objectUrls = [];
 
@@ -103,8 +106,9 @@ export class Menu {
         });
     }
 
-    // free cover-image blob URLs from the previous screen
+    // free cover-image blob URLs (and live-feed listeners) from the previous screen
     setScreen(html) {
+        if (this._cleanup) { this._cleanup(); this._cleanup = null; }
         for (const u of this.objectUrls) URL.revokeObjectURL(u);
         this.objectUrls = [];
         this.root.innerHTML = html;
@@ -644,6 +648,7 @@ export class Menu {
                 <div class="panel-header">
                     <div class="panel-title">REPLAYS</div>
                     <div class="browse-controls tabs">
+                        ${tabBtn('live', '● Live')}
                         ${tabBtn('players', 'Players')}
                         ${tabBtn('levels', 'Levels')}
                         ${tabBtn('file', 'File / Link')}
@@ -663,7 +668,8 @@ export class Menu {
                 this.showReplays();
             };
         });
-        if (ui.tab === 'players') ui.player ? this.renderPlayerScores() : this.renderPlayerSearch();
+        if (ui.tab === 'live') this.renderLive();
+        else if (ui.tab === 'players') ui.player ? this.renderPlayerScores() : this.renderPlayerSearch();
         else if (ui.tab === 'levels') ui.lb ? this.renderLeaderboard() : this.renderLevelSearch();
         else this.renderReplayFile();
     }
@@ -688,11 +694,42 @@ export class Menu {
         return input;
     }
 
-    blError(box, err) {
-        console.error(err);
-        box.innerHTML = `<div class="browse-msg">${esc(err.message)}
-            <br><br><button class="btn small" id="err-file">Open a replay file instead</button>
-            <button class="btn small" id="err-settings">Settings</button></div>`;
+    // spinner that explains the wait when requests go through a public relay
+    loadingInto(box) {
+        box.innerHTML = `<div class="loading-spinner"></div><div class="browse-msg small-msg" id="slow-hint"></div>`;
+        clearTimeout(this._slowTimer);
+        this._slowTimer = setTimeout(() => {
+            const h = $('slow-hint');
+            if (h) h.textContent = settings.get('blProxy')
+                ? 'Waiting for your proxy…'
+                : 'Going through a public relay — this can take up to ~15 seconds. (Set up the free proxy in Settings to make it instant.)';
+        }, 2500);
+    }
+
+    // query: what the person searched for, so we can offer to watch for it live
+    blError(box, err, { query = '', retry = null } = {}) {
+        console.error(err, err.details || '');
+        clearTimeout(this._slowTimer);
+        if (!(err instanceof BeatLeaderUnreachable)) {
+            box.innerHTML = `<div class="browse-msg">${esc(err.message)}
+                ${retry ? '<br><br><button class="btn small" id="err-retry">Try again</button>' : ''}</div>`;
+            if (retry) $('err-retry').onclick = retry;
+            return;
+        }
+        const details = err.details && err.details.length
+            ? `<details class="err-details"><summary>What was tried</summary>${err.details.map(esc).join('<br>')}</details>` : '';
+        box.innerHTML = `<div class="browse-msg">${esc(err.message)}${details}
+            <div class="err-actions">
+                <button class="btn small primary" id="err-live">Watch live replays</button>
+                ${query ? `<button class="btn small" id="err-follow">Wait for “${esc(query)}” in the live feed</button>` : ''}
+                ${retry ? '<button class="btn small" id="err-retry">Try again</button>' : ''}
+                <button class="btn small" id="err-file">Open a replay file / link</button>
+                <button class="btn small" id="err-settings">Set up the free proxy</button>
+            </div>
+            <small>The live feed and replay files always work, no setup needed.</small></div>`;
+        $('err-live').onclick = () => { this.replayUi.liveFilter = ''; this.showReplays('live'); };
+        if (query) $('err-follow').onclick = () => { this.replayUi.liveFilter = query; this.showReplays('live'); };
+        if (retry) $('err-retry').onclick = retry;
         $('err-file').onclick = () => this.showReplays('file');
         $('err-settings').onclick = () => this.showSettings();
     }
@@ -704,12 +741,12 @@ export class Menu {
         const run = async (q) => {
             ui.playerQuery = q;
             if (!q.trim()) { ui.players = null; return this.renderPlayerList(); }
-            body.innerHTML = '<div class="loading-spinner"></div>';
+            this.loadingInto(body);
             try {
                 const r = await searchPlayers(q);
                 ui.players = r.players;
                 if (body.isConnected) this.renderPlayerList();
-            } catch (err) { if (body.isConnected) this.blError(body, err); }
+            } catch (err) { if (body.isConnected) this.blError(body, err, { query: q, retry: () => run(q) }); }
         };
         const input = this.searchBar('player-search', 'Search a BeatLeader username…', ui.playerQuery, run);
         this.renderPlayerList();
@@ -770,7 +807,7 @@ export class Menu {
         const ui = this.replayUi;
         const body = $('replay-body');
         if (!body) return;
-        body.innerHTML = '<div class="loading-spinner"></div>';
+        this.loadingInto(body);
         try {
             const r = await getPlayerScores(ui.player, { search: ui.scoreQuery, sortBy: ui.scoreSort, page: ui.scorePage });
             if (!body.isConnected) return;
@@ -779,7 +816,7 @@ export class Menu {
                 return;
             }
             this.renderScoreList(body, r.scores, { showSong: true }, r.total, ui.scorePage, (pg) => { ui.scorePage = pg; this.loadPlayerScores(); });
-        } catch (err) { if (body.isConnected) this.blError(body, err); }
+        } catch (err) { if (body.isConnected) this.blError(body, err, { query: ui.player.name, retry: () => this.loadPlayerScores() }); }
     }
 
     // --- levels ---
@@ -789,12 +826,12 @@ export class Menu {
         const run = async (q) => {
             ui.levelQuery = q;
             if (!q.trim()) { ui.levels = null; return this.renderLevelList(); }
-            body.innerHTML = '<div class="loading-spinner"></div>';
+            this.loadingInto(body);
             try {
                 const r = await searchLevels(q);
                 ui.levels = r.levels;
                 if (body.isConnected) this.renderLevelList();
-            } catch (err) { if (body.isConnected) this.blError(body, err); }
+            } catch (err) { if (body.isConnected) this.blError(body, err, { query: q, retry: () => run(q) }); }
         };
         const input = this.searchBar('level-search', 'Search levels (song, artist, mapper)…', ui.levelQuery, run);
         this.renderLevelList();
@@ -849,40 +886,65 @@ export class Menu {
         const ui = this.replayUi;
         const body = $('replay-body');
         if (!body) return;
-        body.innerHTML = '<div class="loading-spinner"></div>';
+        this.loadingInto(body);
         try {
             const r = await getLeaderboard(ui.lb.id, ui.lbPage);
             if (!body.isConnected) return;
             if (!r.scores.length) { body.innerHTML = '<div class="browse-msg">No scores on this difficulty yet.</div>'; return; }
             this.renderScoreList(body, r.scores, { showPlayer: true }, r.total, ui.lbPage, (pg) => { ui.lbPage = pg; this.loadLeaderboard(); });
-        } catch (err) { if (body.isConnected) this.blError(body, err); }
+        } catch (err) { if (body.isConnected) this.blError(body, err, { query: ui.level.song.name, retry: () => this.loadLeaderboard() }); }
     }
 
-    renderScoreList(body, scores, { showSong = false, showPlayer = false }, total, page, onPage) {
+    // one score row; live rows show both who played and what they played
+    scoreRow(s, { showSong = false, showPlayer = false, live = false } = {}) {
+        const row = document.createElement('div');
+        row.className = 'song-row score-row' + (live ? ' live-in' : '');
+        const diff = `<span class="diff-chip static diff-${esc(s.diff.name)}">${s.diff.mode !== 'Standard' ? esc(s.diff.mode) + ' ' : ''}${esc(DIFF_LABEL[s.diff.name] || s.diff.name)}</span>`;
+        const avatar = s.playerAvatar ? `<img class="avatar small" src="${esc(s.playerAvatar)}" alt="" loading="lazy">` : '<div class="avatar small"></div>';
+        let left, title, line2, line3;
+        if (live) {
+            left = avatar;
+            title = `${esc(s.playerName)} <span class="live-song">· ${esc(s.song.name)}</span>`;
+            line2 = `${diff} ${[s.song.author && esc(s.song.author), s.modifiers && `<span class="mods">${esc(s.modifiers)}</span>`].filter(Boolean).join(' · ')}`;
+            line3 = 'just now';
+        } else {
+            left = showPlayer ? `<div class="score-rank">#${s.rank}</div>${avatar}` : `<img class="song-cover" src="${esc(s.song.cover)}" alt="" loading="lazy">`;
+            title = showPlayer ? esc(s.playerName) : esc(s.song.name);
+            line2 = `${showSong ? esc(s.song.author) + ' · ' : ''}${diff} ${s.modifiers ? `<span class="mods">${esc(s.modifiers)}</span>` : ''}`;
+            line3 = `${showSong ? 'mapped by ' + esc(s.song.mapper) + ' · ' : ''}${esc(fmtDate(s.timeset))}`;
+        }
+        row.innerHTML = `
+            ${left}
+            <div class="song-meta">
+                <div class="song-name">${title}</div>
+                <div class="song-artist">${line2}</div>
+                <div class="song-mapper">${line3}</div>
+            </div>
+            <div class="song-right">
+                <div class="score-acc">${(s.accuracy * 100).toFixed(2)}%</div>
+                <div class="song-hs">${s.score.toLocaleString()} ${s.pp ? `· ${s.pp.toFixed(1)}pp` : ''}</div>
+                <div class="badges">${s.fullCombo ? '<span class="badge fc">FC</span>' : `<span class="badge miss">${s.misses} miss${s.misses === 1 ? '' : 'es'}</span>`}</div>
+            </div>
+            <button class="dl-btn watch-btn">Watch ▶</button>`;
+        row.onclick = () => this.watchReplay({ score: s });
+        const unavailable = () => {
+            row.classList.add('unavailable');
+            const b = row.querySelector('.watch-btn');
+            b.textContent = isDownloadableHash(s.song.hash) ? 'Map not public' : 'Official level';
+            b.title = 'This map isn\'t on BeatSaver, so it can\'t be downloaded to replay';
+            row.onclick = () => toast('That map isn\'t on BeatSaver (official or unpublished level), so its replay can\'t be shown', 'error');
+        };
+        // official levels can never be downloaded; live scores are often on unpublished maps
+        if (!isDownloadableHash(s.song.hash)) unavailable();
+        else if (live) mapAvailable(s.song.hash).then(ok => { if (!ok) unavailable(); });
+        return row;
+    }
+
+    renderScoreList(body, scores, opts, total, page, onPage) {
+        clearTimeout(this._slowTimer);
         body.innerHTML = '<div class="score-list"></div>';
         const list = body.firstChild;
-        for (const s of scores) {
-            const row = document.createElement('div');
-            row.className = 'song-row score-row';
-            const diff = `<span class="diff-chip static diff-${esc(s.diff.name)}">${s.diff.mode !== 'Standard' ? esc(s.diff.mode) + ' ' : ''}${esc(DIFF_LABEL[s.diff.name] || s.diff.name)}</span>`;
-            row.innerHTML = `
-                ${showPlayer
-                    ? `<div class="score-rank">#${s.rank}</div>${s.playerAvatar ? `<img class="avatar small" src="${esc(s.playerAvatar)}" alt="" loading="lazy">` : '<div class="avatar small"></div>'}`
-                    : `<img class="song-cover" src="${esc(s.song.cover)}" alt="" loading="lazy">`}
-                <div class="song-meta">
-                    <div class="song-name">${showPlayer ? esc(s.playerName) : esc(s.song.name)}</div>
-                    <div class="song-artist">${showSong ? esc(s.song.author) + ' · ' : ''}${diff} ${s.modifiers ? `<span class="mods">${esc(s.modifiers)}</span>` : ''}</div>
-                    <div class="song-mapper">${showSong ? 'mapped by ' + esc(s.song.mapper) + ' · ' : ''}${esc(fmtDate(s.timeset))}</div>
-                </div>
-                <div class="song-right">
-                    <div class="score-acc">${(s.accuracy * 100).toFixed(2)}%</div>
-                    <div class="song-hs">${s.score.toLocaleString()} ${s.pp ? `· ${s.pp.toFixed(1)}pp` : ''}</div>
-                    <div class="badges">${s.fullCombo ? '<span class="badge fc">FC</span>' : `<span class="badge miss">${s.misses} miss${s.misses === 1 ? '' : 'es'}</span>`}</div>
-                </div>
-                <button class="dl-btn watch-btn">Watch ▶</button>`;
-            row.onclick = () => this.watchReplay({ score: s });
-            list.appendChild(row);
-        }
+        for (const s of scores) list.appendChild(this.scoreRow(s, opts));
         const pages = Math.max(1, Math.ceil((total || 0) / 20));
         const pager = document.createElement('div');
         pager.className = 'pager';
@@ -892,6 +954,54 @@ export class Menu {
             ${scores.length >= 20 && page < pages ? '<button class="btn small" data-pg="1">Next →</button>' : ''}`;
         pager.querySelectorAll('[data-pg]').forEach(b => { b.onclick = () => { onPage(page + Number(b.dataset.pg)); body.scrollTop = 0; }; });
         body.appendChild(pager);
+    }
+
+    // --- live feed (works anywhere — BeatLeader's score socket needs no relay) ---
+    renderLive() {
+        const ui = this.replayUi;
+        $('replay-controls').innerHTML = `
+            <span class="live-chip" id="live-state"><span class="dot"></span><span>Connecting…</span></span>
+            <input class="search-box" id="live-filter" type="text" placeholder="Filter by player or song — e.g. a username to watch for" value="${esc(ui.liveFilter)}">`;
+        const body = $('replay-body');
+        body.innerHTML = `<div class="live-new hidden" id="live-new"></div><div class="score-list" id="live-list"></div><div class="browse-msg" id="live-empty"></div>`;
+        const list = $('live-list');
+        let hovering = false, pending = 0;
+        const render = () => {
+            pending = 0;
+            $('live-new').classList.add('hidden');
+            const shown = liveScores.scores.filter(x => scoreMatches(x, ui.liveFilter)).slice(0, 40);
+            list.innerHTML = '';
+            for (const x of shown) list.appendChild(this.scoreRow(x, { live: true }));
+            $('live-empty').innerHTML = shown.length ? '' : ui.liveFilter
+                ? `Waiting for a score from a player or song matching <b>“${esc(ui.liveFilter)}”</b>…<br><small>Leave this open — it shows up the moment they finish a map.</small>`
+                : 'Waiting for the next score…<br><small>Every replay set on BeatLeader appears here live.</small>';
+        };
+        const input = $('live-filter');
+        input.addEventListener('input', () => { ui.liveFilter = input.value; render(); });
+        // don't shuffle rows under the pointer; collect new ones instead
+        list.addEventListener('pointerenter', () => { hovering = true; });
+        list.addEventListener('pointerleave', () => { hovering = false; if (pending) render(); });
+        $('live-new').onclick = render;
+        const labels = { idle: 'Offline', connecting: 'Connecting…', live: 'Live', reconnecting: 'Reconnecting…' };
+        this._cleanup = liveScores.subscribe((ev) => {
+            if (!list.isConnected) return;
+            if (ev.type === 'state') {
+                const chip = $('live-state');
+                chip.className = 'live-chip ' + ev.state;
+                chip.lastElementChild.textContent = labels[ev.state] || ev.state;
+            } else if (ev.type === 'score' && scoreMatches(ev.score, ui.liveFilter)) {
+                if (ui.liveFilter && ev.score.playerName && scoreMatches({ ...ev.score, song: {} }, ui.liveFilter)) {
+                    toast(`${ev.score.playerName} just set a score — ready to watch`, 'success');
+                }
+                if (hovering) {
+                    pending++;
+                    const nb = $('live-new');
+                    nb.textContent = `${pending} new score${pending === 1 ? '' : 's'} — show`;
+                    nb.classList.remove('hidden');
+                } else render();
+            }
+        });
+        render();
     }
 
     // --- file / link ---
@@ -1111,6 +1221,7 @@ export class Menu {
                 <div class="setting-control"><input class="search-box setting-text" type="text" placeholder="${esc(placeholder)}" value="${esc(s.get(key) || '')}"></div>`;
             row.querySelector('input').onchange = (e) => { s.set(key, e.target.value.trim()); toast('Saved'); };
             body.appendChild(row);
+            return row;
         };
 
         const pct = (v) => Math.round(v * 100) + '%';
@@ -1128,6 +1239,28 @@ export class Menu {
         toggle('bloom', 'Glow / Bloom', 'Fancy graphics. Turn off on slow devices', (v) => this.engine.setBloom(v));
         toggle('wallDistortion', 'Wall Distortion', 'Real-time energy-field effect on walls', null);
         slider('bloomStrength', 'Glow Intensity', 'How strong the bloom glow is', 0, 1.2, 0.05, (v) => v.toFixed(2));
-        text('blProxy', 'BeatLeader Proxy', 'Optional — makes player/level search reliable (see proxy/README.md)', 'https://your-worker.workers.dev');
+        const proxyRow = text('blProxy', 'BeatLeader Proxy', 'Optional — makes player/level search fast and reliable (see proxy/README.md)', 'your-worker.workers.dev');
+        const pin = proxyRow.querySelector('input');
+        pin.onchange = () => {
+            const v = normalizeProxyUrl(pin.value);
+            pin.value = v;
+            s.set('blProxy', v);
+            toast(v ? 'Proxy saved — press Test to check it' : 'Proxy removed');
+        };
+        const testBtn = document.createElement('button');
+        testBtn.className = 'btn small';
+        testBtn.textContent = 'Test';
+        const testOut = document.createElement('div');
+        testOut.className = 'setting-value proxy-result';
+        testBtn.onclick = async () => {
+            pin.onchange();
+            testBtn.disabled = true;
+            testOut.textContent = 'Testing…';
+            const r = await testProxy();
+            testBtn.disabled = false;
+            testOut.textContent = r.ok ? `Works ✓ (${r.ms} ms)` : `Not working: ${r.error}`;
+            testOut.classList.toggle('ok', r.ok);
+        };
+        proxyRow.querySelector('.setting-control').append(testBtn, testOut);
     }
 }
