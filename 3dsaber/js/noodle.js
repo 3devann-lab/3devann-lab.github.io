@@ -261,6 +261,16 @@ export class TrackSystem {
         this.now = 0;
     }
 
+    // names of tracks some event animates any of `props` on
+    tracksAnimating(props) {
+        const out = new Set();
+        for (const ev of this.events) {
+            if ((ev.type !== 'AnimateTrack' && ev.type !== 'AssignPathAnimation') || !ev.props || !ev.tracks) continue;
+            if (props.some(p => p in ev.props)) for (const name of ev.tracks) out.add(name);
+        }
+        return out;
+    }
+
     // meters per unit for absolute positions (env / parent / player tracks)
     get absUnit() { return this.v2 ? UNIT : 1; }
 

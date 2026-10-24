@@ -19,8 +19,23 @@ Then open the printed URL in **Chrome or Edge** (best audio codec support for cu
 
 - Connect an Xbox or PlayStation controller (any standard-mapping gamepad works).
 - **Menus**: right thumbstick moves the cursor, **A** (Xbox) / **✕** (PlayStation) clicks, **B/○** goes back, left stick scrolls. A real mouse works too.
-- **In game**: left stick = left saber, right stick = right saber. Flick the stick in the arrow's direction as the note reaches you. Avoid bombs and walls.
-- **Start/Options** (or Esc) pauses.
+- **In game**: left stick = left saber, right stick = right saber. The stick places the middle of the blade on the
+  note grid: centred = your saber's inner lane, middle row; push to reach the other lanes and rows (diagonals reach
+  the corners). Flick through a note in its arrow's direction for a PERFECT. Avoid bombs and walls.
+- **Start/Options** (or Esc) pauses. **Settings** in the pause menu changes controls, camera, sound and look live.
+
+### Controls (Settings → Controls)
+
+Horizontal / vertical reach, rest height and spread, reach corners, deadzone, full-tilt point, response curve,
+saber smoothing, blade tilt, swap sticks, invert vertical, aim assist (0% = off),
+vibration strength. Hits are checked along the blade's whole path between frames, so fast flicks and low frame
+rates never let a note slip through, and each cut is judged at its best moment while the blade touches the note.
+
+### Modifiers and practice
+
+On the difficulty screen open **Modifiers & Practice**: No Fail, Instant Fail, Strict Angles, No Arrows,
+Ghost Notes, Disappearing Arrows, Small Notes, No Bombs, No Walls, song speed 0.5x–2x, and **Practice from**
+any point in the song. Practice runs and speeds below 1x don't save high scores.
 
 ## Replays
 
@@ -66,9 +81,9 @@ Everything is remembered for the next replay and can also be set in **Settings**
 | R / F | back to start / fullscreen | LT RT, LB RB | free camera: zoom, down / up |
 
 **Players** and **Levels** need BeatLeader's API, which only answers browsers on beatleader.xyz and `localhost`
-dev ports (`npx serve` on port 3000 works for local testing). On your own site, deploy the tiny free worker in
-[`proxy/`](proxy/README.md) and paste its URL into **Settings → BeatLeader Proxy** (press **Test** to check it).
-Without it the game falls back to free public relays, which are often down. Live and File / Link never need it.
+dev ports. The game goes through the site's proxy worker (`shy-mud-5208.3devann.workers.dev`) by default, so search
+works out of the box. **Settings → BeatLeader Proxy** takes your own worker URL instead (see [`proxy/`](proxy/README.md)),
+or `off` to use only the free public relays. Live and File / Link never need it.
 
 ## Features
 
@@ -82,11 +97,23 @@ Without it the game falls back to free public relays, which are often down. Live
 - Full lighting-event playback (lasers, rings, flashes) with bloom post-processing
 - Scoring with combo multiplier (x1–x8), accuracy, ranks (SS–D), per-map high scores
 - Energy bar with fail — or turn on **No Fail** in settings
-- Settings: volumes, saber colors, note speed, saber trail length, cursor sensitivity, graphics quality, bloom toggle
+- Settings (70+): controls, modifiers, sound (hit sound style, miss sound, **audio offset** for Bluetooth delay),
+  look (note size, hit text style, sparks, cut halves, light brightness, **reduce flashing**), HUD (size,
+  opacity, song timer, FPS counter), graphics, camera, replays — each section has its own Reset, plus Reset All
+- Results show Perfect / Good / OK / bad cuts / misses / bombs and hits per hand
 - **Camera**: field of view, height, distance and tilt for the play camera, changeable from the pause menu while
   playing (the paused picture updates as you drag); separate first-person and follow cameras for replays
 
 ## Performance & stability
+
+- Walls are drawn in two instanced batches (one draw call each, however many a wall-art map shows) with
+  shader-drawn edges; the costly distortion effect is limited to real walls near you. Animated environment
+  pieces on model maps are instanced too, and notes only get their own material when their track really
+  animates colour or dissolve. Shaders are compiled while the level loads, not at the first wall
+- **Overload Protection**: if a map pushes the GPU into very slow frames (the step before a driver reset can
+  take the whole browser down), the level switches to lighter graphics instead of freezing
+- Songs that can't be decoded into memory (long songs on low-memory devices) are decoded at a lower sample
+  rate, or streamed, instead of failing with "Unable to decode audio data"
 
 - Notes, bombs, walls and effects share geometry/materials (no per-object GPU buffers); sparks and
   cut halves are pooled; per-object materials are freed as soon as an object leaves

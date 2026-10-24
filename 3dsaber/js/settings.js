@@ -13,8 +13,52 @@ const DEFAULTS = {
     wallDistortion: true, // real-time energy-field shader on walls
     cursorSpeed: 1.0,
     quality: 'auto',      // auto (dynamic resolution) / high / medium / low
-    blProxy: '',          // optional CORS proxy for the BeatLeader API (see proxy/README.md)
+    safeMode: true,       // drop to light graphics if a map overloads the GPU
+    blProxy: '',          // BeatLeader API proxy: '' = built-in worker, a URL, or 'off' (see proxy/README.md)
     trailLength: 0.12,    // saber trail length in seconds (0 = off)
+
+    // thumbstick → saber (the stick places the blade's cutting point on the note grid)
+    stickDeadzone: 0.1,   // radial, 0..1
+    stickRange: 0.94,     // how far you must push for "full tilt"
+    stickCurve: 1,        // 1 = linear, >1 = finer near centre
+    stickSquare: true,    // diagonals reach the grid corners
+    saberReachX: 1.2,     // metres from rest at full tilt (lanes are 0.6 m apart)
+    saberReachY: 0.8,
+    saberRestHeight: 1.4, // middle note row
+    saberRestSpread: 0.3, // rest spots at ±0.3 m: each saber sits on its inner lane
+    saberSmoothing: 0.012, // seconds; 0 = raw stick
+    saberTilt: 29,        // degrees the blade leans toward the notes
+    swapSticks: false,
+    invertY: false,
+    rumble: 1,
+
+    // modifiers (normal play; picked on the difficulty screen)
+    modSpeed: 1,          // song speed 0.5–2
+    modNoArrows: false,
+    modGhost: false,      // note bodies invisible, arrows only
+    modDisappear: false,  // arrows vanish before the note arrives
+    modNoBombs: false,
+    modNoWalls: false,
+    modInstantFail: false,
+    modSmallNotes: false,
+    modStrict: false,     // cutting against the arrow is a bad cut
+
+    // sound
+    audioOffset: 0,       // ms: + if hits sound late (Bluetooth headphones), - if early
+    hitSound: 'soft',     // soft (synth) / classic (sample) / off
+    missSound: true,
+
+    // look & HUD
+    noteSize: 1,
+    judgeStyle: 'words',  // words (PERFECT) / numbers (115) / off
+    hitParticles: 1,      // spark amount 0–2
+    cutHalves: true,      // cut notes split into two halves
+    lightBrightness: 1,
+    reduceFlashing: false, // no strobes: light changes glide (photosensitivity)
+    hudScale: 1,
+    hudOpacity: 1,
+    hudTimer: true,
+    showFps: false,
 
     // play camera (normal play, and the replay third-person view)
     camFov: 72,
@@ -54,6 +98,13 @@ export const CAMERA_KEYS = ['camFov', 'camHeight', 'camDistance', 'camTilt',
 export const REPLAY_KEYS = ['replayCamera', 'replayHud', 'replayCutText', 'replayHitSounds', 'replayStats',
     'replayHead', 'replaySkipIntro', 'replayShowMisses', 'trailLength', 'freeCam'];
 export const defaultSetting = (key) => DEFAULTS[key];
+export const ALL_KEYS = Object.keys(DEFAULTS);
+export const CONTROL_KEYS = ['stickDeadzone', 'stickRange', 'stickCurve', 'stickSquare', 'saberReachX', 'saberReachY',
+    'saberRestHeight', 'saberRestSpread', 'saberSmoothing', 'saberTilt', 'swapSticks', 'invertY', 'rumble'];
+export const MOD_KEYS = ['modSpeed', 'modNoArrows', 'modGhost', 'modDisappear', 'modNoBombs', 'modNoWalls',
+    'modInstantFail', 'modSmallNotes', 'modStrict'];
+export const PLAY_KEYS = ['audioOffset', 'hitSound', 'missSound', 'noteSize', 'judgeStyle', 'hitParticles', 'cutHalves'];
+export const VISUAL_KEYS = ['lightBrightness', 'reduceFlashing', 'hudScale', 'hudOpacity', 'hudTimer', 'showFps'];
 
 class Settings {
     constructor() {

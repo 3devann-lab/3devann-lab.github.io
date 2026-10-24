@@ -1,9 +1,9 @@
 // ============ BeatLeader: player search, scores, leaderboards, replays ============
 // BeatLeader's API (api.beatleader.xyz / .com) only answers browsers on its own
 // sites and on localhost dev ports. Anywhere else (like evanblokender.org)
-// requests have to go through a relay: your own proxy if you set one up
-// (Settings → BeatLeader Proxy, see proxy/README.md), otherwise free public
-// CORS relays, raced in parallel. Replay files (cdn.replays.beatleader.*) and
+// requests go through a relay: the built-in proxy worker (or your own, from
+// Settings → BeatLeader Proxy, see proxy/README.md), then free public CORS
+// relays, raced in parallel. Replay files (cdn.replays.beatleader.*) and
 // the live-scores WebSocket allow any origin, so watching never needs a relay.
 import { settings } from './settings.js';
 
@@ -29,11 +29,20 @@ export function normalizeProxyUrl(raw) {
     return p;
 }
 
+// The site's own proxy worker — used unless Settings names another one, or "off"
+export const DEFAULT_PROXY = 'https://shy-mud-5208.3devann.workers.dev';
+
+export function proxyUrl() {
+    const v = String(settings.get('blProxy') || '').trim();
+    if (v.toLowerCase() === 'off') return '';
+    return normalizeProxyUrl(v) || DEFAULT_PROXY;
+}
+
 function customRoute() {
-    const p = normalizeProxyUrl(settings.get('blProxy'));
+    const p = proxyUrl();
     if (!p) return null;
     return {
-        id: 'custom', label: 'your proxy', kind: 'json',
+        id: 'custom', label: p === DEFAULT_PROXY ? 'built-in proxy' : 'your proxy', kind: 'json',
         // a generic relay with a {url} placeholder, or a forwarding worker's base URL
         make: (u, path) => (p.includes('{url}') ? p.replace('{url}', enc(u)) : p.replace(/\/+$/, '') + path),
     };
@@ -121,7 +130,8 @@ async function fetchViaRoutes(path) {
     const custom = customRoute();
     const ordered = custom ? [custom, DIRECT] : [DIRECT];
     const all = [...ordered, ...PUBLIC_RELAYS];
-    const pref = all.find(r => r.id === preferred) || null;
+    // with a proxy configured it always goes first; otherwise start with what worked last time
+    const pref = custom ? null : (all.find(r => r.id === preferred) || null);
 
     // 1. whatever worked last time
     if (pref) {
@@ -145,7 +155,7 @@ async function fetchViaRoutes(path) {
         if (notFound) throw new Error('Not found on BeatLeader');
     }
     const err = new BeatLeaderUnreachable(customRoute()
-        ? 'Couldn\'t reach BeatLeader through your proxy. Open Settings and press Test next to BeatLeader Proxy to see what\'s wrong.'
+        ? 'Couldn\'t reach BeatLeader through the proxy. Open Settings and press Test next to BeatLeader Proxy to see what\'s wrong.'
         : 'Player and level search can\'t load on this site yet. BeatLeader only lets its own website read player and level data, '
           + 'and the free public relays aren\'t answering. Set up your own free proxy (about 2 minutes, see Settings → BeatLeader Proxy) '
           + 'and search will work every time.');
@@ -156,7 +166,7 @@ async function fetchViaRoutes(path) {
 // Settings → "Test": check just your proxy
 export async function testProxy() {
     const r = customRoute();
-    if (!r) return { ok: false, error: 'No proxy URL set' };
+    if (!r) return { ok: false, error: 'Proxy is turned off' };
     const t = performance.now();
     try {
         const d = await fetchJson(r.make(API + '/players?search=a&count=1', '/players?search=a&count=1'), 'json', 12000);
