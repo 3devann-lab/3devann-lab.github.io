@@ -1563,7 +1563,12 @@ export class Gameplay {
         for (const m of tmp) { m.position.set(0, -50, 0); this.scene.add(m); }
         const batches = Object.values(this.wallBatches);
         for (const b of batches) b.mesh.visible = true;
-        try { this.engine.renderer.compile(this.scene, this.engine.camera); } catch (e) { /* compiled on first use instead */ }
+        // the scene is drawn into the post-processing target, and three.js builds a
+        // different shader variant for render targets than for the screen
+        const r = this.engine.renderer, prev = r.getRenderTarget();
+        if (this.engine.useComposer) r.setRenderTarget(this.engine.composer.renderTarget1);
+        try { r.compile(this.scene, this.engine.camera); } catch (e) { /* compiled on first use instead */ }
+        r.setRenderTarget(prev);
         for (const b of batches) b.mesh.visible = false;
         for (const m of tmp) this.scene.remove(m);
     }
