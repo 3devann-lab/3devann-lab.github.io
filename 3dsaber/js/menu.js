@@ -354,12 +354,35 @@ export class Menu {
                 onEnd: (results) => this.endLevel(results, mapId, diff),
             });
             this.engine.gameplay = this.gameplay;
+            this.checkAudioUnlocked();
         } catch (err) {
             console.error(err);
             toast('Failed to start level: ' + err.message, 'error');
             this.abortGameplay();
             if (replayCtx) this.showReplays(); else this.showSongs();
         }
+    }
+
+    // Browsers only allow sound after a click/key/touch — a gamepad press
+    // doesn't count. The song clock is the audio clock, so without this the
+    // level sat on "READY" forever. Ask for one click if needed.
+    checkAudioUnlocked() {
+        setTimeout(() => {
+            if (!this.gameplay || !audio.blocked) return;
+            const el = document.createElement('div');
+            el.className = 'modal-backdrop';
+            el.innerHTML = `<div class="modal" style="text-align:center"><h2>Click or press any key</h2>
+                <div class="sub" style="margin:8px 0 0">Your browser needs one click or key press before it can play sound.</div></div>`;
+            document.body.appendChild(el);
+            const go = () => {
+                window.removeEventListener('pointerdown', go, true);
+                window.removeEventListener('keydown', go, true);
+                audio.resume();
+                el.remove();
+            };
+            window.addEventListener('pointerdown', go, true);
+            window.addEventListener('keydown', go, true);
+        }, 400);
     }
 
     endLevel(results, mapId, diff) {

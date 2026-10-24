@@ -1,61 +1,52 @@
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Beat Saber 3D</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#06060f">
+    <title>MOSU</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script type="importmap">
         {
             "imports": {
-                "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.1/three.module.min.js",
-                "OrbitControls": "https://cdn.jsdelivr.net/npm/three-orbit-controls@1.0.1/index.min.js",
-                "tween": "https://cdnjs.cloudflare.com/ajax/libs/tween.js/21.0.0/tween.esm.min.js"
+                "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.1/three.module.min.js"
             }
         }
     </script>
 </head>
 <body>
-    <div id="game-container"></div>
-    <div id="overlay">
-        <div id="controller-status">Press Start to play!</div>
-        <button id="start-button">Start Game</button>
-        <button id="editor-button" style="margin-top: 10px;">Level Editor</button>
-    </div>
-    <div id="game-info" style="display: none;">
-        <div id="score">Score: 0</div>
-        <div id="combo">Combo: 0</div>
-    </div>
-    <div id="feedback-message"></div>
+    <div id="game"></div>
 
-    <!-- Level Editor UI -->
-    <div id="editor-overlay" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.9); z-index: 10;">
-        <div style="padding: 20px; max-width: 800px; margin: 50px auto; background-color: #222; border-radius: 8px;">
-            <h2>Level Editor</h2>
-            <label for="editor-song-upload">Upload Song (MP3):</label>
-            <input type="file" id="editor-song-upload" accept=".mp3" /><br><br>
-
-            <label for="editor-bpm">BPM:</label>
-            <input type="number" id="editor-bpm" value="120" min="1" /><br><br>
-
-            <label for="editor-note-duration">Note Duration (ms, how long notes are visible):</label>
-            <input type="number" id="editor-note-duration" value="1000" min="100" /><br><br>
-
-            <label for="editor-gap-between-notes">Gap Between Notes (ms):</label>
-            <input type="number" id="editor-gap-between-notes" value="500" min="0" /><br><br>
-
-            <h3>Notes Sequence:</h3>
-            <div id="notes-sequence-editor" style="max-height: 300px; overflow-y: scroll; border: 1px solid #444; padding: 10px; margin-bottom: 10px;">
-                <!-- Note entries will be added here -->
-            </div>
-            <button id="add-note-button">Add Note</button>
-            <button id="generate-json-button" style="margin-left: 10px;">Generate Level JSON</button>
-            <button id="load-level-button" style="margin-left: 10px;">Load Custom Level (ZIP)</button>
-            <button id="back-to-menu-button" style="margin-left: 10px;">Back to Menu</button>
-            <pre id="json-output" style="background-color: #111; padding: 10px; border-radius: 5px; margin-top: 20px; white-space: pre-wrap; word-break: break-all; font-size: 0.8em; display: none;"></pre>
+    <div id="hud" class="hidden">
+        <div id="hud-top">
+            <div id="hud-title"></div>
+            <div id="hud-progress"><div id="hud-progress-fill"></div></div>
+            <div id="hud-time"></div>
         </div>
+        <div id="hud-left">
+            <div id="hud-score">0</div>
+            <div id="hud-acc">100.00%</div>
+        </div>
+        <div id="hud-right">
+            <div id="hud-mult">x1.0</div>
+            <button id="hud-pause" title="Pause (Esc)">❚❚</button>
+        </div>
+        <div id="hud-health"><div id="hud-health-fill"></div></div>
+        <div id="hud-bottom">
+            <div id="hud-combo"></div>
+            <div id="hud-combo-label">COMBO</div>
+        </div>
+        <div id="judgement"></div>
+        <div id="judgement-sub"></div>
+        <div id="combo-burst"></div>
     </div>
 
-    <script type="module" src="main.js"></script>
-    <audio id="background-music" loop></audio>
+    <div id="ui"></div>
+    <div id="toasts"></div>
+
+    <script type="module" src="js/main.js"></script>
 </body>
 </html>

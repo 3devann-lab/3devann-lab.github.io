@@ -1,61 +1,99 @@
-# Custom Level Editor & Importer Guide
+# MOSU Guide
 
-This guide explains how to create your own custom levels for the game and how to import them.
+MOSU is a rhythm game: arrows fly down a neon tunnel toward the ring, and you press the
+matching direction the moment each one reaches it.
 
-## 1. Using the In-Game Level Editor
+## Controls
 
-The easiest way to create a custom level is by using the built-in level editor.
+| Input | Up | Down | Left | Right | Pause |
+|---|---|---|---|---|---|
+| Keyboard | `W` / `↑` / `I` | `S` / `↓` / `K` | `A` / `←` / `J` | `D` / `→` / `L` | `Esc` / `P` |
+| Controller | D-pad ↑ / `Y` | D-pad ↓ / `A` | D-pad ← / `X` | D-pad → / `B` | Start |
+| Phone / tablet | swipe up | swipe down | swipe left | swipe right | ❚❚ button |
 
-### Steps:
-1. **Start the Game:** Open `index.html` in your browser.
-2. **Access Editor:** Click the "Level Editor" button on the main menu.
-3. **Upload Song (Optional but Recommended):**
-   - Click "Upload Song (MP3)" to select an MP3 file from your computer. This will be the background music for your custom level.
-   - **Important:** The editor itself doesn't play the song while editing. You'll need to listen to your song separately to time the notes.
-4. **Set Level Parameters:**
-   - **BPM (Beats Per Minute):** This is for reference and can help with timing if you know your song's BPM. It doesn't directly affect note speed but is part of the level data.
-   - **Note Duration (ms):** This determines how long a note is visible on screen before it passes the hit point. A shorter duration means notes move faster and require quicker reactions.
-   - **Gap Between Notes (ms):** This is the time interval between the appearance of consecutive notes. A shorter gap means notes appear more frequently.
-5. **Add Notes:**
-   - Click "Add Note" repeatedly to add notes to your sequence.
-   - For each added note, use the dropdown to select its required direction (Up, Down, Left, Right).
-   - You can remove notes using the "Remove" button next to each entry.
-6. **Generate Level JSON:**
-   - Once you're happy with your note sequence and parameters, click "Generate Level JSON".
-   - The JSON data for your level will appear in a text area below. Copy this entire text.
-7. **Save Your Level:**
-   - Open a plain text editor (like Notepad, VS Code, Sublime Text).
-   - Paste the copied JSON into the new file.
-   - Save the file as `your_level_name.json` (e.g., `my_first_level.json`).
+A controller's left stick also works (flick it), and the D-pad + `A`/`B` navigate the menus.
 
-## 2. Preparing Your Custom Level ZIP File
+## Notes
 
-To play your custom level in the game, you need to package your `.json` level file and your `.mp3` song file into a single `.zip` archive.
+- **Tap** — press the arrow's direction. Each direction has its own color.
+- **Star** — any direction counts (a tap counts on phones).
+- **Hold** — press, then keep holding until the trail behind the arrow ends.
+- **Flip** (purple, crossed-out arrow) — press the **opposite** direction.
+- **Diagonal** (white outline) — press **both** directions at once (↘ = down + right).
 
-### Steps:
-1. **Locate Files:**
-   - Find the `.json` file you saved in the previous step (e.g., `my_first_level.json`).
-   - Find the `.mp3` song file you want to use for this level (e.g., `my_song.mp3`).
-2. **Create a ZIP Archive:**
-   - **Windows:** Select both your `.json` file and your `.mp3` file. Right-click, then go to "Send to" -> "Compressed (zipped) folder".
-   - **macOS:** Select both your `.json` file and your `.mp3` file. Right-click, then select "Compress [number] items".
-   - **Linux:** Select both files, right-click, and choose "Compress" or "Create Archive", selecting the ZIP format.
-3. **Name Your ZIP:** Name your zip file descriptively (e.g., `MyAwesomeLevel.zip`). The name of the ZIP file is what will be displayed in the game when you load it.
-   - **Crucial:** Ensure BOTH the `.json` file and the `.mp3` file are at the **root** of the ZIP archive, not inside any subfolders within the ZIP.
+Timing windows: **Perfect** ±45 ms, **Great** ±90 ms, **Good** ±135 ms (Settings → *Relaxed* widens them by 40%).
+Every 10 combo raises your multiplier by 0.5, up to x3. Misses drain the health bar; run out and the level fails
+(unless *No fail* is on). Grades: SS (98% and no misses), S 94%, A 88%, B 80%, C 70%, D.
 
-## 3. Importing and Playing Your Custom Level
+If your hits feel consistently early or late, use **Settings → Audio offset → Calibrate**, or press
+**Adjust offset** on the results screen — it measures your average timing for you.
 
-### Steps:
-1. **Start the Game:** Open `index.html` in your browser.
-2. **Access Editor (again):** Click the "Level Editor" button on the main menu.
-3. **Load Custom Level:** Click the "Load Custom Level (ZIP)" button.
-4. **Select Your ZIP:** A file dialog will open. Navigate to and select the `.zip` file you created.
-5. **Confirmation:** If loaded successfully, you will see an alert confirming the level is ready, and you will be returned to the main menu.
-6. **Play:** Click "Start Game". Your custom level with your chosen song and note sequence will begin!
+## Levels
 
-## Troubleshooting
+30 levels in five packs, from one star to ten:
 
-- **"ZIP file must contain a .json level file." / "ZIP file must contain an .mp3 song file."**: Make sure both files are present directly in the root of your ZIP.
-- **"Failed to load custom level."**: Ensure your `.json` file is valid JSON (you can use an online JSON validator if unsure). Also, confirm your `.mp3` file is not corrupted.
-- **Timing issues**: The in-game editor doesn't play music, so precise timing requires external tools or trial-and-error. Adjust `Note Duration` and `Gap Between Notes` to fine-tune the feel of your level.
+| Pack | Stars | What's new |
+|---|---|---|
+| First Light | ★1–2 | the basics, star notes |
+| City Pulse | ★3–4 | holds |
+| Overclock | ★5–6 | streams, flips |
+| Hyperspace | ★7–8 | diagonals |
+| Singularity | ★9–10 | everything, fast |
 
+Clear 3 levels in a pack to unlock the next (or turn on *Unlock all packs* in Settings).
+Every level's song is composed and synthesized right in your browser (synthwave, house, techno, trance,
+drum & bass, chiptune, trap, future bass, lo-fi), and the arrows are charted from that music,
+so they always land on something you can hear.
+
+**Endless** has two modes:
+- *Endless Remix* — a new track every day that loops forever, getting denser and faster each loop.
+- *Endless Classic* — the original MOSU loop with random arrows that keep speeding up.
+
+## Making your own levels
+
+Open **Level Editor** from the main menu.
+
+1. **Pick a song** — *Upload…* any MP3/OGG/WAV, or choose a *MOSU track* to remix one of the built-in songs.
+2. **Set the tempo** — type the BPM, use **Tap** (tap along 4+ times), or let **Auto-chart** detect it.
+   *Beat offset* moves the grid so the lines sit on the beats.
+3. **Add notes**, any mix of:
+   - **✨ Auto-chart** — MOSU listens to the song and places arrows on its beats and hits. The density slider goes from relaxed (1) to intense (10).
+   - **● Record** — the song plays and every key you press becomes a note at that moment. Hold a key to make a hold note.
+   - **Click the timeline** to drop the selected arrow (pick it from ↑ → ↓ ← ★). The snap buttons (1/1 … 1/8) lock notes to the beat grid.
+4. **Edit** — click a note to select it, then `W A S D` changes its direction, `F` makes it a flip, `H` toggles a hold
+   (`[` / `]` shortens/lengthens it), `Delete` removes it. `Space` plays/pauses; the mouse wheel scrolls, `Ctrl` + wheel zooms.
+5. **Test Play** to try it, **Save** to keep it in *My Levels*, **Export .zip** to share it.
+
+### Sharing and importing
+
+*My Levels → Import .zip* (or *Import .zip* in the editor) loads a level someone sent you. A level zip contains
+a `.json` level file and the song (`.mp3`, `.ogg` or `.wav`) — the files can be in any folder inside the zip.
+
+### Level file format
+
+```json
+{
+  "format": "mosu",
+  "version": 2,
+  "title": "My Level",
+  "artist": "Someone",
+  "bpm": 128,
+  "offset": 0,
+  "approach": 1400,
+  "notes": [
+    { "t": 1875, "d": "up" },
+    { "t": 2344, "d": "right", "hold": 469 },
+    { "t": 2813, "d": "left", "flip": true },
+    { "t": 3281, "d": "down", "d2": "right" },
+    { "t": 3750, "d": "any" }
+  ]
+}
+```
+
+- `t` — when the note reaches the ring, in milliseconds from the start of the song.
+- `d` — `up`, `down`, `left`, `right` or `any`; `d2` adds a second direction (diagonal).
+- `hold` — hold length in ms. `flip: true` — press the opposite direction.
+- `approach` — how long (ms) each arrow is visible before it hits; `offset` — beat-grid offset in ms; `bpm` — for the grid.
+
+Levels made with the old editor (`bpm`, `noteDuration`, `gapBetweenNotes`, `notes: [{ "direction": "up" }]`)
+still import and play — their notes are spaced `gapBetweenNotes` ms apart.

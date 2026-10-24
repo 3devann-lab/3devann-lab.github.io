@@ -26,9 +26,9 @@ engine.onGameplayError = (err) => {
 // Audio context needs a user gesture; also load SFX lazily on first interaction
 let audioReady = false;
 function ensureAudio() {
+    audio.init();                 // also resumes a context that started suspended
     if (audioReady) return;
     audioReady = true;
-    audio.init();
     audio.setVolumes(settings.get('musicVolume'), settings.get('sfxVolume'));
     audio.loadSfx('hit', 'hitsound.mp3');
     audio.loadSfx('miss', 'misssound.mp3');

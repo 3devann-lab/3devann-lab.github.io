@@ -16,7 +16,13 @@ class AudioEngine {
     }
 
     init() {
-        if (this.ctx) return;
+        // A context created without a user gesture (e.g. from a gamepad press)
+        // starts suspended and its clock never moves — resume it on any later
+        // gesture, unless the game paused it on purpose.
+        if (this.ctx) {
+            if (this.ctx.state === 'suspended' && !this.userPaused) this.ctx.resume();
+            return;
+        }
         this.ctx = new (window.AudioContext || window.webkitAudioContext)();
         this.musicGain = this.ctx.createGain();
         this.sfxGain = this.ctx.createGain();
@@ -159,11 +165,18 @@ class AudioEngine {
     get songDuration() { return this.songBuffer ? this.songBuffer.duration : 0; }
 
     pause() {
+        this.userPaused = true;
         if (this.ctx && this.ctx.state === 'running') this.ctx.suspend();
     }
 
     resume() {
+        this.userPaused = false;
         if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    }
+
+    // true when sound is blocked waiting for a click/key (browser autoplay rules)
+    get blocked() {
+        return !!this.ctx && this.ctx.state !== 'running' && !this.userPaused;
     }
 
     stopSong() {
