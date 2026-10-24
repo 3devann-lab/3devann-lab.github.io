@@ -2066,6 +2066,9 @@ export class Gameplay {
     }
 
     resolveReplayNotes(t) {
+        // collect everything due this frame and apply it in event order — the
+        // multiplier/combo outcome depends on the order of hits and misses
+        const due = [];
         for (let i = this.liveNotes.length - 1; i >= 0; i--) {
             const g = this.liveNotes[i];
             const ud = g.userData;
@@ -2079,7 +2082,12 @@ export class Gameplay {
                 if (gone) { this.removeObj(g); this.liveNotes.splice(i, 1); }
                 continue;
             }
-            if (t < ev.eventTime) continue;
+            if (t >= ev.eventTime) due.push(g);
+        }
+        if (!due.length) return;
+        due.sort((a, b) => a.userData.rev.eventTime - b.userData.rev.eventTime);
+        for (const g of due) {
+            const ev = g.userData.rev;
             const { scoringType } = splitNoteId(ev.noteID);
             this.processed++;
             this.maxScore += maxCutScore(scoringType) * idealMult(this.processed);
@@ -2103,7 +2111,7 @@ export class Gameplay {
                 this.showJudgement(bad ? 'BAD CUT' : 'MISS', '#ff5a5a');
             }
             this.removeObj(g);
-            this.liveNotes.splice(i, 1);
+            this.liveNotes.splice(this.liveNotes.indexOf(g), 1);
             this.updateHud(ev.eventType === NOTE_EVENT.GOOD);
         }
     }
