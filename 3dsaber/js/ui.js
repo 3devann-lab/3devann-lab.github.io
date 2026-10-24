@@ -145,6 +145,8 @@ export const REPLAY_VIEW_ROWS = [
     ['choice', 'replayCutText', 'Cut Scores', 'Shown for every cut', [['total', '115'], ['split', '70 · 15 · 30'], ['off', 'Off']]],
     ['toggle', 'replayStats', 'Stats Panel', 'Per-hand averages, swing parts and mistakes'],
     ['toggle', 'replayHitSounds', 'Hit Sounds', 'Cut and miss sounds'],
+    ['toggle', 'replayCutHalves', 'Cut Halves', 'Cut notes split into two flying halves'],
+    ['toggle', 'replaySparks', 'Hit Sparks', 'Spark bursts on cuts and bombs'],
     ['toggle', 'replayHead', 'Player Head', 'Show the head in the outside views'],
     ['slider', 'trailLength', 'Saber Trails', 'Trail length (also used when you play)', 0, 0.4, 0.01, fmt.ms],
     ['toggle', 'replayShowMisses', 'Mistakes on Timeline', 'Marks where notes were missed or bombs hit'],

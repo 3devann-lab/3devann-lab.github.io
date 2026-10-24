@@ -390,6 +390,17 @@ export class BeatClock {
         return seg.time + (beat - seg.beat) * 60 / seg.bpm;
     }
     bpmAt(beat) { return this._seg(beat).bpm; }
+    // seconds → beats (the editor maps mouse / audio time back onto the grid)
+    toBeats(sec) {
+        const s = this.segments;
+        let lo = 0, hi = s.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (s[mid].time <= sec) lo = mid; else hi = mid - 1;
+        }
+        const seg = s[lo];
+        return seg.beat + (sec - seg.time) * seg.bpm / 60;
+    }
 }
 
 // ---------- Difficulty file ----------

@@ -19,6 +19,7 @@ import {
     BeatLeaderUnreachable, liveScores, scoreMatches, testProxy, normalizeProxyUrl, proxyUrl, DEFAULT_PROXY,
 } from './beatleader.js';
 import { ReplayControls } from './replayui.js';
+import { Editor } from './editor/editor.js';
 import {
     toast, esc, fmt, settingBuilders, PLAY_CAMERA_ROWS, FIRST_PERSON_ROWS, FOLLOW_ROWS, REPLAY_VIEW_ROWS,
     CONTROL_ROWS, MOD_ROWS, SOUND_ROWS, LOOK_ROWS, HUD_ROWS,
@@ -67,6 +68,8 @@ export class Menu {
             liveFilter: '',
         };
         this.objectUrls = [];
+        this.editor = new Editor(this);
+        this.returnTo = null;       // {editor: projectId} while test-playing from the editor
 
         gamepad.on('connect', () => {
             this.updateControllerChip();
@@ -136,6 +139,7 @@ export class Menu {
                 <button class="btn primary" id="btn-play">Play</button>
                 <button class="btn" id="btn-custom">Custom Levels</button>
                 <button class="btn" id="btn-replays">Replays</button>
+                <button class="btn" id="btn-editor">Map Editor</button>
                 <button class="btn" id="btn-settings">Settings</button>
             </div>
         </div>`);
@@ -144,6 +148,7 @@ export class Menu {
         $('btn-play').onclick = () => this.showSongs();
         $('btn-custom').onclick = () => this.showBrowse();
         $('btn-replays').onclick = () => this.showReplays();
+        $('btn-editor').onclick = () => { this.returnTo = null; this.editor.showProjects(); };
         $('btn-settings').onclick = () => this.showSettings();
     }
 
@@ -183,6 +188,7 @@ export class Menu {
             let coverUrl = rec.meta?.coverURL || null;
             if (rec.coverBlob) { coverUrl = URL.createObjectURL(rec.coverBlob); this.objectUrls.push(coverUrl); }
             const badges =
+                (rec.meta?.own ? '<span class="badge own">Your map</span>' : '') +
                 (rec.meta?.hasChroma ? '<span class="badge chroma">Chroma</span>' : '') +
                 (rec.meta?.hasNoodle ? '<span class="badge noodle">Noodle</span>' : '');
             list.appendChild(this.songRow({
@@ -419,7 +425,7 @@ export class Menu {
             console.error(err);
             toast('Failed to start level: ' + err.message, 'error');
             this.abortGameplay();
-            if (replayCtx) this.showReplays(); else this.showSongs();
+            if (replayCtx) this.showReplays(); else if (this.returnTo && this.returnTo.editor) this.backToEditor(); else this.showSongs();
         }
     }
 
@@ -467,8 +473,17 @@ export class Menu {
         this.showResults(results, isNewBest);
     }
 
+    // back to the map editor after a test play
+    backToEditor() {
+        const id = this.returnTo && this.returnTo.editor;
+        this.returnTo = null;
+        this.practice = null;
+        if (id) this.editor.openProject(id); else this.showHome();
+    }
+
     showResults(r, isNewBest) {
         const rc = this.currentLevel && this.currentLevel.replayCtx;
+        const fromEditor = !rc && this.returnTo && this.returnTo.editor;
         const who = rc ? esc(rc.playerName || rc.data.info.playerName || 'Player') : '';
         this.setScreen(`
         <div class="screen">
@@ -492,19 +507,21 @@ export class Menu {
                 </div>` : ''}
                 ${r.practice ? '<div class="result-kicker" style="margin-top:8px">PRACTICE — HIGH SCORE NOT SAVED</div>' : ''}
                 <div class="menu-buttons" style="width:100%">
-                    <button class="btn primary" id="btn-retry">${rc ? 'Watch Again' : 'Retry'}</button>
-                    <button class="btn" id="btn-continue">${rc ? 'Back to Replays' : 'Song Select'}</button>
+                    ${fromEditor ? '<button class="btn primary" id="btn-to-editor">Back to Editor</button>' : ''}
+                    <button class="btn ${fromEditor ? '' : 'primary'}" id="btn-retry">${rc ? 'Watch Again' : fromEditor ? 'Play Again' : 'Retry'}</button>
+                    ${fromEditor ? '' : `<button class="btn" id="btn-continue">${rc ? 'Back to Replays' : 'Song Select'}</button>`}
                     <button class="btn" id="btn-home">Main Menu</button>
                 </div>
             </div>
         </div>`);
-        this.enterMenuMode(() => (rc ? this.showReplays() : this.showSongs()));
+        this.enterMenuMode(() => (fromEditor ? this.backToEditor() : rc ? this.showReplays() : this.showSongs()));
+        if (fromEditor) $('btn-to-editor').onclick = () => this.backToEditor();
         $('btn-retry').onclick = () => {
             const { builtinSong, record, diff, replayCtx } = this.currentLevel;
             this.startLevel(builtinSong, record, diff, replayCtx);
         };
-        $('btn-continue').onclick = () => (rc ? this.showReplays() : this.showSongs());
-        $('btn-home').onclick = () => this.showHome();
+        if (!fromEditor) $('btn-continue').onclick = () => (rc ? this.showReplays() : this.showSongs());
+        $('btn-home').onclick = () => { this.returnTo = null; this.showHome(); };
     }
 
     // ============ PAUSE ============
@@ -528,7 +545,7 @@ export class Menu {
                     <button class="btn primary" id="btn-resume">Resume</button>
                     <button class="btn" id="btn-camera">Settings</button>
                     <button class="btn" id="btn-restart">Restart</button>
-                    <button class="btn danger" id="btn-quit">Quit to Menu</button>
+                    <button class="btn danger" id="btn-quit">${this.returnTo && this.returnTo.editor ? 'Back to Editor' : 'Quit to Menu'}</button>
                 </div>
             </div>
         </div>`);
@@ -542,7 +559,7 @@ export class Menu {
         };
         $('btn-quit').onclick = () => {
             this.abortGameplay();
-            this.showHome();
+            if (this.returnTo && this.returnTo.editor) this.backToEditor(); else this.showHome();
         };
     }
 
@@ -1340,7 +1357,7 @@ export class Menu {
 
         b.section('Replays', 'Everything here can also be changed while watching (⚙ Options)',
             resetAndRedraw(['replayCamera', 'replayHud', 'replayCutText', 'replayHitSounds', 'replayStats',
-                'replayHead', 'replaySkipIntro', 'replayShowMisses'], 'Replay options reset')).id = 'sec-replays';
+                'replayHead', 'replaySkipIntro', 'replayShowMisses', 'replayCutHalves', 'replaySparks'], 'Replay options reset')).id = 'sec-replays';
         b.rows(REPLAY_VIEW_ROWS.filter(r => r[1] !== 'trailLength'));
 
         b.section('Graphics').id = 'sec-graphics';

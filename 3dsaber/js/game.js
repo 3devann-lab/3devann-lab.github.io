@@ -27,7 +27,8 @@ const LAYER_STEP = 0.55;
 const WALL_STEP = UNIT;
 const SPAWN_LEAD_Y = 0.35;
 const SABER_Z = 0.25;           // saber plane in front of the hit point (normal play)
-const FANCY_WALLS = 160;        // walls drawn with the distortion effect at once (the rest use the light look)
+const FANCY_WALLS = 160;
+const PREVIEW_LINGER = 0.08;    // editor preview: notes stay this long at the player (so the cursor's notes show)        // walls drawn with the distortion effect at once (the rest use the light look)
 const CAM_MODES = ['first', 'third', 'follow', 'free'];
 const BLADE_LEN = 1.05;
 const CUT_AT = 0.6;             // metres up the saber (from the hilt) that the stick places on the note grid
@@ -670,9 +671,27 @@ export class Engine {
         this.camera.updateProjectionMatrix();
     }
 
-    applySize() {
-        this.camera.aspect = innerWidth / innerHeight;
+    // Show the whole camera view inside one rectangle of the screen (the
+    // editor's preview panel) instead of full-screen. null = full screen.
+    setViewBox(rect) {
+        this.viewBox = rect && rect.width > 20 && rect.height > 20 ? { x: rect.left, y: rect.top, w: rect.width, h: rect.height } : null;
+        this.applyView();
+    }
+
+    applyView() {
+        const b = this.viewBox;
+        if (b) {
+            this.camera.aspect = b.w / b.h;
+            this.camera.setViewOffset(b.w, b.h, -b.x, -b.y, innerWidth, innerHeight);
+        } else {
+            this.camera.aspect = innerWidth / innerHeight;
+            this.camera.clearViewOffset();
+        }
         this.camera.updateProjectionMatrix();
+    }
+
+    applySize() {
+        this.applyView();
         this.renderer.setPixelRatio(this.renderScale);
         this.renderer.setSize(innerWidth, innerHeight);
         this.composer.setPixelRatio(this.renderScale);
@@ -1390,15 +1409,20 @@ export class Gameplay {
         this.songBuffer = songBuffer;
         this.opts = opts;
         this.replay = opts.replay || null;
+        // editor preview: the map plays with no sabers, input or scoring
+        this.preview = !!opts.preview;
         // modifiers + practice start (normal play only): {speed, noArrows, ghost,
         // disappear, noBombs, noWalls, instantFail, smallNotes, strict, practiceStart}
-        this.mods = this.replay ? {} : (opts.mods || {});
+        this.mods = this.replay || this.preview ? {} : (opts.mods || {});
         this.v2 = mapData.version === 2;
 
-        const speedMult = this.replay ? 1 : settings.get('noteSpeed');
+        const speedMult = this.replay || this.preview ? 1 : settings.get('noteSpeed');
         this.speedMult = speedMult;
         this.bpm = opts.bpm || 120;
-        if (this.replay) {
+        if (this.preview) {                       // exactly what the map says
+            this.njs = Math.max(1, opts.njs || 10);
+            this.rt = reactionTime(this.njs, opts.offsetBeats || 0, this.bpm);
+        } else if (this.replay) {
             this.njs = Math.max(1, opts.njs || 10);
             const jd = this.replay.data.info.jumpDistance;
             this.rt = jd > 1 ? jd / 2 / this.njs : reactionTime(this.njs, opts.offsetBeats || 0, this.bpm);
@@ -1406,7 +1430,7 @@ export class Gameplay {
             this.njs = Math.max(8, Math.min(20, (opts.njs || 12))) * speedMult;
             this.rt = Math.max(1.15, reactionTime(this.njs, opts.offsetBeats || 0, this.bpm) / speedMult);
         }
-        this.aimAssist = this.replay ? 0 : settings.get('aimAssist');
+        this.aimAssist = this.replay || this.preview ? 0 : settings.get('aimAssist');
 
         // Beat Saber's player origin for gameplay objects
         this.objRoot = new THREE.Group();
@@ -1486,7 +1510,7 @@ export class Gameplay {
         this.failed = false;
         this.finished = false;
         this.paused = false;
-        this.noFail = this.replay ? true : settings.get('noFail');
+        this.noFail = this.replay || this.preview ? true : settings.get('noFail');
 
         // HUD refs + write cache (only touch the DOM when a value changes)
         this.$ = (id) => document.getElementById(id);
@@ -1519,7 +1543,15 @@ export class Gameplay {
             this.replayStartAt = startAt;
             this.setCameraMode(settings.get('replayCamera'));
         }
-        audio.onSongEnd = () => { if (!this.failed) this.finish(); };
+        if (this.preview) {
+            startAt = opts.startAt || 0;
+            this.saberLeft.group.visible = this.saberRight.group.visible = false;
+            this.saberLeft.setTrailLength(0);
+            this.saberRight.setTrailLength(0);
+            audio.onSongEnd = () => { if (this.opts.onEnd) this.opts.onEnd({ ended: true }); };
+        } else {
+            audio.onSongEnd = () => { if (!this.failed) this.finish(); };
+        }
         audio.startSong(songBuffer, startAt, rate);
         // practice: jump in a couple of seconds before the chosen moment
         if (!this.replay && this.mods.practiceStart > 0) this.seek(this.mods.practiceStart - 2.5);
@@ -1539,6 +1571,10 @@ export class Gameplay {
         this.noteScale = S.num('noteSize', 0.5, 1.5) * (this.mods.smallNotes ? 0.6 : 1);
         for (const g of this.liveNotes) g.userData.size = this.noteScale;
         this.engine.applyVisualSettings();
+    }
+
+    sparkScale() {
+        return this.replay && !this.ro.sparks ? 0 : this.vis.particles;
     }
 
     playHitSound(strength) {
@@ -1957,7 +1993,7 @@ export class Gameplay {
 
         // countdown display
         const cd = this.$('countdown');
-        if (t < 0) {
+        if (t < 0 && !this.preview) {
             const n = Math.ceil(-t / (audio.songRate || 1));
             const label = n > 3 ? 'READY' : String(n);
             if (cd.textContent !== label) {
@@ -1980,7 +2016,7 @@ export class Gameplay {
         if (this.replay) {
             this.updateReplayPose(t);
             this.updateReplayCamera(dt);
-        } else {
+        } else if (!this.preview) {
             const c = this.ctl, a = gamepad.raw;
             let L = shapeStick(a[0], a[1], c.shape), R = shapeStick(a[2], a[3], c.shape);
             if (c.swap) [L, R] = [R, L];
@@ -2123,11 +2159,12 @@ export class Gameplay {
         for (const g of this.liveNotes) g.userData.wp.setFromMatrixPosition(g.matrixWorld);
 
         // pass 2: gentle aim assist pulls sabers toward the nearest matching note
-        if (!this.replay) this.applyAimAssist();
+        if (!this.replay && !this.preview) this.applyAimAssist();
         this.saberLeft.finalize(dt, !!this.replay);
         this.saberRight.finalize(dt, !!this.replay);
 
         if (this.replay) { this.resolveReplayNotes(t); return; }
+        if (this.preview) { this.expirePreviewNotes(t); return; }
 
         // pass 3: hits and misses. Timing windows follow each note's LIFETIME
         // (world-anchored), exactly like the real game — player/camera movement
@@ -2228,8 +2265,10 @@ export class Gameplay {
         if (_swing.lengthSq() < 0.01) _swing.set(0, -1);
         _swing.normalize();
         const color = ud.mat.color;
-        if (this.vis.halves) this.engine.slices.spawn(ud.wp, _swing, color);
-        const n = Math.round(18 * this.vis.particles);
+        // replays have their own switches (Replay options), normal play uses Look
+        const halves = this.replay ? this.ro.halves : this.vis.halves;
+        if (halves) this.engine.slices.spawn(ud.wp, _swing, color);
+        const n = Math.round(18 * this.sparkScale());
         if (n) this.engine.particles.burst(ud.wp, color, n);
     }
 
@@ -2344,7 +2383,7 @@ export class Gameplay {
                     this.bombHit(m, i);
                     continue;
                 }
-            } else if (!ud.decorative && zt > -0.8 && zt < 0.8) {
+            } else if (!this.preview && !ud.decorative && zt > -0.8 && zt < 0.8) {
                 const touching = (s) => s.distanceTo(ud.wp) < 0.22 && s.smoothVel.length() > 0.6;
                 if (touching(this.saberLeft) || touching(this.saberRight)) {
                     this.bombHit(m, i);
@@ -2371,7 +2410,7 @@ export class Gameplay {
         if (!this.replay || this.ro.hitSounds) this.playMissSound(0.9, 0.7);
         if (!this.replay) gamepad.rumble(220, 1, 1);
         this.showJudgement('BOMB!', '#ff2d2d');
-        const nb = Math.round(26 * this.vis.particles);
+        const nb = Math.round(26 * this.sparkScale());
         if (nb) this.engine.particles.burst(ud.wp, _bombColor, nb);
         this.removeObj(m);
         this.liveBombs.splice(i, 1);
@@ -2405,7 +2444,7 @@ export class Gameplay {
             m.matrixWorld.multiplyMatrices(wr.matrixWorld, m.matrix);
 
             // saber inside a real wall drains energy a bit (never for wall art)
-            if (!ud.decorative && !this.replay && headZ > -2 && headZ - ud.length < 2) {
+            if (!ud.decorative && !this.replay && !this.preview && headZ > -2 && headZ - ud.length < 2) {
                 ud.wp.setFromMatrixPosition(m.matrixWorld);
                 const inside = (saber) => {
                     const p = saber.tip;
@@ -2666,14 +2705,15 @@ export class Gameplay {
         const aliveNote = (events) => (o) => {
             const ev = events && events.get(o);
             if (ev) return ev.eventTime > target;
-            return events || o.decorative ? target - o.time <= 2.5 * this.noteRt(o) : o.time >= target;
+            return events || o.decorative ? target - o.time <= 2.5 * this.noteRt(o) : o.time >= target - (this.preview ? PREVIEW_LINGER : 0);
         };
         const M = R ? this.replay.match : null;
         this.noteIdx = respawn(this.noteQueue, this.spawnNote, aliveNote(M && M.noteEvents));
         this.bombIdx = respawn(this.bombQueue, this.spawnBomb, aliveNote(M && M.bombEvents));
         this.wallIdx = respawn(this.wallQueue, this.spawnWall, (w) => !this.wallGone(w, target, this.noteRt(w), this.noteSpeed(w), this.wallLength(w)));
 
-        audio.seek(target + this.latency);
+        // a held editor preview just shows the moment; the music stays stopped
+        if (!(this.preview && this.paused)) audio.seek(target + this.latency);
         this._camSnap = true;
         this._hud.prog = -1;
         this.updateHud();
@@ -2748,6 +2788,8 @@ export class Gameplay {
             hitSounds: settings.get('replayHitSounds') !== false,
             cutText: settings.get('replayCutText') || 'total',
             stats: !!this.replay && !!settings.get('replayStats'),
+            halves: settings.get('replayCutHalves') !== false,
+            sparks: settings.get('replaySparks') !== false,
         };
         const trail = settings.num('trailLength', 0, 0.4);
         this.saberLeft.setTrailLength(trail);
@@ -2899,6 +2941,15 @@ export class Gameplay {
             this.removeObj(g);
             this.liveNotes.splice(this.liveNotes.indexOf(g), 1);
             this.updateHud(!!p);
+        }
+    }
+
+    // editor preview: notes vanish as they reach you (as if cut), scenery lives on
+    expirePreviewNotes(t) {
+        for (let i = this.liveNotes.length - 1; i >= 0; i--) {
+            const g = this.liveNotes[i], ud = g.userData;
+            const over = (t - ud.note.time) / ud.rt;
+            if (ud.decorative ? over > 2.5 : t >= ud.note.time + PREVIEW_LINGER) { this.removeObj(g); this.liveNotes.splice(i, 1); }
         }
     }
 
