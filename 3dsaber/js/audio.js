@@ -16,7 +16,13 @@ class AudioEngine {
     }
 
     init() {
-        if (this.ctx) return;
+        // A context created without a user gesture (e.g. from a gamepad press)
+        // starts suspended and its clock never moves — resume it on any later
+        // gesture, unless the game paused it on purpose.
+        if (this.ctx) {
+            if (this.ctx.state === 'suspended' && !this.userPaused) this.ctx.resume();
+            return;
+        }
         this.ctx = new (window.AudioContext || window.webkitAudioContext)();
         this.musicGain = this.ctx.createGain();
         this.sfxGain = this.ctx.createGain();
@@ -119,10 +125,13 @@ class AudioEngine {
     }
 
     // Starts the song clock immediately at `offset` (negative = countdown lead-in).
-    startSong(buffer, offset = -2.0) {
+    // `rate` speeds the song up/down (replays with speed modifiers); the clock
+    // stays in song seconds.
+    startSong(buffer, offset = -2.0, rate = 1) {
         this.init();
         this.stopSong();
         this.songBuffer = buffer;
+        this.songRate = rate > 0 ? rate : 1;
         this.songStartCtxTime = this.ctx.currentTime;
         this.songStartOffset = offset;
         this.playing = true;
@@ -132,6 +141,7 @@ class AudioEngine {
     _scheduleSource(offset) {
         const src = this.ctx.createBufferSource();
         src.buffer = this.songBuffer;
+        src.playbackRate.value = this.songRate;
         src.connect(this.musicGain);
         this.songSource = src;
         src.onended = () => {
@@ -141,7 +151,7 @@ class AudioEngine {
             }
         };
         if (offset < 0) {
-            src.start(this.ctx.currentTime - offset, 0);
+            src.start(this.ctx.currentTime - offset / this.songRate, 0);
         } else {
             src.start(this.ctx.currentTime, Math.min(offset, this.songBuffer.duration));
         }
@@ -149,17 +159,24 @@ class AudioEngine {
 
     get songTime() {
         if (!this.ctx || !this.playing && this.songSource === null) return 0;
-        return this.songStartOffset + (this.ctx.currentTime - this.songStartCtxTime);
+        return this.songStartOffset + (this.ctx.currentTime - this.songStartCtxTime) * (this.songRate || 1);
     }
 
     get songDuration() { return this.songBuffer ? this.songBuffer.duration : 0; }
 
     pause() {
+        this.userPaused = true;
         if (this.ctx && this.ctx.state === 'running') this.ctx.suspend();
     }
 
     resume() {
+        this.userPaused = false;
         if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    }
+
+    // true when sound is blocked waiting for a click/key (browser autoplay rules)
+    get blocked() {
+        return !!this.ctx && this.ctx.state !== 'running' && !this.userPaused;
     }
 
     stopSong() {
