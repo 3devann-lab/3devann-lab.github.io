@@ -1,83 +1,170 @@
 // ============ BeatLeader: player search, scores, leaderboards, replays ============
-// api.beatleader.xyz only sends CORS headers to beatleader.xyz itself, so a
-// page hosted anywhere else can't call it directly. Requests try, in order:
-// a remembered working route, your own proxy (Settings → BeatLeader proxy,
-// see proxy/README.md), a direct call, then public CORS proxies.
-// Replay files come from cdn.replays.beatleader.xyz, which allows any origin.
+// BeatLeader's API (api.beatleader.xyz / .com) only answers browsers on its own
+// sites and on localhost dev ports. Anywhere else (like evanblokender.org)
+// requests have to go through a relay: your own proxy if you set one up
+// (Settings → BeatLeader Proxy, see proxy/README.md), otherwise free public
+// CORS relays, raced in parallel. Replay files (cdn.replays.beatleader.*) and
+// the live-scores WebSocket allow any origin, so watching never needs a relay.
 import { settings } from './settings.js';
 
 const API = 'https://api.beatleader.xyz';
 const REPLAY_CDN = 'https://cdn.replays.beatleader.xyz';
+const LIVE_SOCKET = 'wss://sockets.api.beatleader.xyz/scores';
 
-const PUBLIC_PROXIES = [
-    { id: 'corsproxy', make: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
-    { id: 'allorigins', make: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
-    { id: 'codetabs', make: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
+const enc = encodeURIComponent;
+// kind 'json': the body is BeatLeader's JSON; 'wrapped': {contents: "<json text>", status: {http_code}}
+const PUBLIC_RELAYS = [
+    { id: 'allorigins', label: 'allorigins', kind: 'wrapped', make: (u) => `https://api.allorigins.win/get?url=${enc(u)}` },
+    { id: 'allorigins-raw', label: 'allorigins (raw)', kind: 'json', make: (u) => `https://api.allorigins.win/raw?url=${enc(u)}` },
+    { id: 'codetabs', label: 'codetabs', kind: 'json', make: (u) => `https://api.codetabs.com/v1/proxy/?quest=${enc(u)}` },
+    { id: 'cors-eu', label: 'cors.eu.org', kind: 'json', make: (u) => `https://cors.eu.org/${u}` },
 ];
+const DIRECT = { id: 'direct', label: 'direct', kind: 'json', make: (u) => u };
 
-let workingRoute = null;
-try { workingRoute = sessionStorage.getItem('saber3d_bl_route'); } catch (e) { /* storage blocked */ }
+// people paste "my-proxy.workers.dev" without the scheme
+export function normalizeProxyUrl(raw) {
+    let p = String(raw || '').trim();
+    if (!p) return '';
+    if (!/^https?:\/\//i.test(p)) p = 'https://' + p;
+    return p;
+}
 
-function customProxyRoute() {
-    const p = String(settings.get('blProxy') || '').trim();
+function customRoute() {
+    const p = normalizeProxyUrl(settings.get('blProxy'));
     if (!p) return null;
     return {
-        id: 'custom',
-        // either a generic proxy with a {url} placeholder, or a forwarding worker base URL
-        make: (u, path) => (p.includes('{url}')
-            ? p.replace('{url}', encodeURIComponent(u))
-            : p.replace(/\/+$/, '') + path),
+        id: 'custom', label: 'your proxy', kind: 'json',
+        // a generic relay with a {url} placeholder, or a forwarding worker's base URL
+        make: (u, path) => (p.includes('{url}') ? p.replace('{url}', enc(u)) : p.replace(/\/+$/, '') + path),
     };
 }
 
-async function fetchWithTimeout(url, ms, asJson = true) {
+function httpError(status) {
+    const e = new Error(status === 404 ? 'not found' : status === 429 ? 'rate limited' : `HTTP ${status}`);
+    e.status = status;
+    return e;
+}
+
+async function fetchJson(url, kind, ms, signal) {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), ms);
+    const abort = () => ctl.abort();
+    if (signal) {
+        if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort, { once: true });
+    }
+    const timer = setTimeout(abort, ms);
     try {
         const res = await fetch(url, { signal: ctl.signal });
-        if (!res.ok) {
-            const err = new Error(`HTTP ${res.status}`);
-            err.status = res.status;
-            throw err;
+        if (!res.ok) throw httpError(res.status);
+        let data = await res.json();                 // relay error pages (HTML) throw here
+        if (kind === 'wrapped') {
+            const code = data && data.status && data.status.http_code;
+            if (code && code >= 400) throw httpError(code);
+            if (!data || typeof data.contents !== 'string' || !data.contents) throw new Error('empty relay response');
+            data = JSON.parse(data.contents);
         }
-        return asJson ? await res.json() : await res.arrayBuffer();
+        if (!data || typeof data !== 'object') throw new Error('unexpected response');
+        return data;
+    } catch (e) {
+        if (e.name === 'AbortError') throw new Error(signal && signal.aborted ? 'cancelled' : 'timed out');
+        if (e instanceof SyntaxError) throw new Error('relay returned an error page');
+        if (e instanceof TypeError && !e.status) throw new Error('blocked by the browser (CORS) or offline');
+        throw e;
     } finally {
         clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', abort);
     }
 }
 
 export class BeatLeaderUnreachable extends Error {}
 
-async function blGet(path) {
-    const url = API + path;
-    const routes = [];
-    const custom = customProxyRoute();
-    if (custom) routes.push(custom);
-    routes.push({ id: 'direct', make: (u) => u });
-    routes.push(...PUBLIC_PROXIES);
-    if (workingRoute) {
-        const i = routes.findIndex(r => r.id === workingRoute);
-        if (i > 0) routes.unshift(routes.splice(i, 1)[0]);
-    }
+// Remember which route worked (for a day) so later requests go straight there
+let preferred = null;
+try {
+    const saved = JSON.parse(localStorage.getItem('saber3d_bl_route') || 'null');
+    if (saved && Date.now() - saved.t < 86400000) preferred = saved.id;
+} catch (e) { /* storage blocked */ }
+function remember(id) {
+    if (preferred === id) return;
+    preferred = id;
+    try { localStorage.setItem('saber3d_bl_route', JSON.stringify({ id, t: Date.now() })); } catch (e) { /* ignore */ }
+}
 
-    let lastErr = null;
-    for (const r of routes) {
+const memo = new Map();           // path -> {t, data}; lists don't change by the second
+const MEMO_MS = 3 * 60 * 1000;
+
+async function blGet(path) {
+    const hit = memo.get(path);
+    if (hit && Date.now() - hit.t < MEMO_MS) return hit.data;
+    const data = await fetchViaRoutes(path);
+    memo.set(path, { t: Date.now(), data });
+    if (memo.size > 100) memo.delete(memo.keys().next().value);
+    return data;
+}
+
+async function fetchViaRoutes(path) {
+    const url = API + path;
+    const errors = [];
+    let notFound = false;
+    const attempt = async (r, ms, signal) => {
         try {
-            const data = await fetchWithTimeout(r.make(url, path), r.id === 'direct' ? 8000 : 9000);
-            if (workingRoute !== r.id) {
-                workingRoute = r.id;
-                try { sessionStorage.setItem('saber3d_bl_route', r.id); } catch (e) { /* ignore */ }
-            }
+            const data = await fetchJson(r.make(url, path), r.kind, ms, signal);
+            remember(r.id);
             return data;
         } catch (e) {
-            // a real API answer (e.g. 404 for an unknown id) is final
-            if (e.status === 404 && (r.id === 'direct' || r.id === 'custom')) throw new Error('Not found on BeatLeader');
-            lastErr = e.name === 'AbortError' ? new Error('timed out') : e;
+            if (e.status === 404) notFound = true;
+            if (e.message !== 'cancelled') errors.push(`${r.label}: ${e.message}`);
+            throw e;
         }
+    };
+
+    const custom = customRoute();
+    const ordered = custom ? [custom, DIRECT] : [DIRECT];
+    const all = [...ordered, ...PUBLIC_RELAYS];
+    const pref = all.find(r => r.id === preferred) || null;
+
+    // 1. whatever worked last time
+    if (pref) {
+        try { return await attempt(pref, PUBLIC_RELAYS.includes(pref) ? 15000 : 10000); }
+        catch (e) { if (notFound) throw new Error('Not found on BeatLeader'); }
     }
-    throw new BeatLeaderUnreachable(
-        'Couldn\'t reach BeatLeader from this page' + (lastErr ? ` (${lastErr.message})` : '') +
-        '. Add your own proxy in Settings → BeatLeader Proxy, or open a .bsor replay file instead.');
+    // 2. your proxy, then a direct call (works on BeatLeader's own sites and localhost dev ports)
+    for (const r of ordered) {
+        if (r === pref) continue;
+        try { return await attempt(r, r === custom ? 12000 : 6000); }
+        catch (e) { if (notFound) throw new Error('Not found on BeatLeader'); }
+    }
+    // 3. public relays, raced — first good answer wins, the rest are cancelled
+    const relays = PUBLIC_RELAYS.filter(r => r !== pref);
+    const ctl = new AbortController();
+    try {
+        const data = await Promise.any(relays.map(r => attempt(r, 15000, ctl.signal)));
+        ctl.abort();
+        return data;
+    } catch (e) {
+        if (notFound) throw new Error('Not found on BeatLeader');
+    }
+    const err = new BeatLeaderUnreachable(customRoute()
+        ? 'Couldn\'t reach BeatLeader through your proxy. Open Settings and press Test next to BeatLeader Proxy to see what\'s wrong.'
+        : 'Player and level search can\'t load on this site yet. BeatLeader only lets its own website read player and level data, '
+          + 'and the free public relays aren\'t answering. Set up your own free proxy (about 2 minutes, see Settings → BeatLeader Proxy) '
+          + 'and search will work every time.');
+    err.details = errors;
+    throw err;
+}
+
+// Settings → "Test": check just your proxy
+export async function testProxy() {
+    const r = customRoute();
+    if (!r) return { ok: false, error: 'No proxy URL set' };
+    const t = performance.now();
+    try {
+        const d = await fetchJson(r.make(API + '/players?search=a&count=1', '/players?search=a&count=1'), 'json', 12000);
+        if (!Array.isArray(d.data)) throw new Error('that URL answered, but not with BeatLeader data');
+        return { ok: true, ms: Math.round(performance.now() - t) };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
 }
 
 // ---------- normalizers ----------
@@ -255,4 +342,84 @@ export function countryFlag(code) {
     if (!code || code.length !== 2) return '';
     const A = 0x1f1e6;
     return String.fromCodePoint(A + code.toUpperCase().charCodeAt(0) - 65, A + code.toUpperCase().charCodeAt(1) - 65);
+}
+
+// ---------- live scores (no relay needed) ----------
+// BeatLeader pushes every new score over a WebSocket, and WebSockets aren't
+// subject to CORS, so this works on any site. One shared connection, kept
+// open briefly after the last listener leaves so tab switches are smooth.
+class LiveScores {
+    constructor() {
+        this.scores = [];            // newest first
+        this.listeners = new Set();
+        this.state = 'idle';         // idle | connecting | live | reconnecting
+        this.ws = null;
+        this.retry = 0;
+    }
+
+    subscribe(fn) {
+        this.listeners.add(fn);
+        clearTimeout(this.closeTimer);
+        this.connect();
+        fn({ type: 'state', state: this.state });
+        return () => {
+            this.listeners.delete(fn);
+            if (!this.listeners.size) {
+                this.closeTimer = setTimeout(() => {
+                    if (this.listeners.size || !this.ws) return;
+                    const ws = this.ws;
+                    this.ws = null;
+                    ws.onclose = null;
+                    ws.close();
+                    this.setState('idle');
+                }, 30000);
+            }
+        };
+    }
+
+    emit(ev) { for (const fn of this.listeners) fn(ev); }
+    setState(state) { this.state = state; this.emit({ type: 'state', state }); }
+
+    connect() {
+        if (this.ws) return;
+        this.setState(this.retry ? 'reconnecting' : 'connecting');
+        let ws;
+        try { ws = new WebSocket(LIVE_SOCKET); } catch (e) { this.scheduleRetry(); return; }
+        this.ws = ws;
+        ws.onopen = () => { this.retry = 0; this.setState('live'); };
+        ws.onmessage = (m) => {
+            let d;
+            try { d = JSON.parse(m.data); } catch (e) { return; }
+            if (!d || !d.replay || !d.leaderboard) return;
+            const s = normScore(d, d.leaderboard, d.player ? normPlayer(d.player) : null);
+            s.live = true;
+            this.scores.unshift(s);
+            if (this.scores.length > 80) this.scores.length = 80;
+            this.emit({ type: 'score', score: s });
+        };
+        ws.onclose = () => {
+            if (this.ws !== ws) return;
+            this.ws = null;
+            if (this.listeners.size) this.scheduleRetry();
+            else this.setState('idle');
+        };
+        ws.onerror = () => { /* onclose follows */ };
+    }
+
+    scheduleRetry() {
+        this.retry++;
+        this.setState('reconnecting');
+        const wait = [1000, 2000, 5000, 10000, 20000][Math.min(4, this.retry - 1)];
+        clearTimeout(this.retryTimer);
+        this.retryTimer = setTimeout(() => { if (this.listeners.size) this.connect(); }, wait);
+    }
+}
+
+export const liveScores = new LiveScores();
+
+// does a score match a free-text filter (player name or song/artist/mapper)?
+export function scoreMatches(s, q) {
+    q = String(q || '').trim().toLowerCase();
+    if (!q) return true;
+    return [s.playerName, s.song.name, s.song.author, s.song.mapper].some(v => String(v || '').toLowerCase().includes(q));
 }
