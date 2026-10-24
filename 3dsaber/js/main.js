@@ -52,11 +52,11 @@ function loop() {
     const gp = menu.gameplay;
     if (gp && !gp.paused && !gp.finished) {
         if (gamepad.justPressed(Buttons.START)) menu.pauseGame();
-        else if (gp.replay && gamepad.justPressed(Buttons.Y)) menu.toggleReplayCamera();
     } else {
         cursor.update(dt);
         if (gp && gp.paused && gamepad.justPressed(Buttons.START)) menu.resumeGame();
     }
+    if (menu.replayControls && menu.gameplay) menu.replayControls.update(dt);
 
     engine.update();
 }

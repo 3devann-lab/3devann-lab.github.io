@@ -157,6 +157,31 @@ class AudioEngine {
         }
     }
 
+    // Jump to song time `t` (replay seeking); keeps the current rate. Works
+    // while paused too: the clock stays at `t` until the context resumes.
+    seek(t) {
+        if (!this.ctx || !this.songBuffer) return;
+        const end = this.songBuffer.duration;
+        t = Math.min(t, end - 0.01);
+        if (this.songSource) {
+            const src = this.songSource;
+            this.songSource = null;
+            try { src.onended = null; src.stop(); } catch (e) { /* not started yet */ }
+        }
+        this.songStartCtxTime = this.ctx.currentTime;
+        this.songStartOffset = t;
+        this.playing = true;
+        this._scheduleSource(t);
+    }
+
+    // Change playback speed without moving the song clock
+    setRate(rate) {
+        if (!(rate > 0) || !this.ctx || !this.songBuffer || Math.abs(rate - (this.songRate || 1)) < 1e-4) return;
+        const t = this.songTime;
+        this.songRate = rate;
+        this.seek(t);
+    }
+
     get songTime() {
         if (!this.ctx || !this.playing && this.songSource === null) return 0;
         return this.songStartOffset + (this.ctx.currentTime - this.songStartCtxTime) * (this.songRate || 1);

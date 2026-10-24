@@ -14,7 +14,46 @@ const DEFAULTS = {
     cursorSpeed: 1.0,
     quality: 'auto',      // auto (dynamic resolution) / high / medium / low
     blProxy: '',          // optional CORS proxy for the BeatLeader API (see proxy/README.md)
+    trailLength: 0.12,    // saber trail length in seconds (0 = off)
+
+    // play camera (normal play, and the replay third-person view)
+    camFov: 72,
+    camHeight: 1.85,      // metres above the floor
+    camDistance: 5.6,     // metres behind the sabers
+    camTilt: 3,           // degrees looking down
+
+    // replay first-person camera (the player's own head)
+    fpFov: 80,
+    fpPosSmooth: 0.2,     // 0 = raw head movement, 1 = very smooth
+    fpRotSmooth: 0.3,
+    fpLevelHorizon: false, // remove head roll (tilt) so the horizon stays level
+    fpOffsetBack: 0,      // pull the view back behind the head (metres)
+    fpOffsetUp: 0,
+
+    // replay follow camera (chases the player's head from behind)
+    followDistance: 1.8,
+    followHeight: 0.5,
+    followSmooth: 0.6,
+
+    // replays
+    replayCamera: 'third',      // first / third / follow / free
+    replayHud: true,
+    replayCutText: 'total',     // total / split (pre·acc·post) / off
+    replayHitSounds: true,
+    replayStats: true,          // live per-hand accuracy overlay
+    replayHead: true,           // show the player's head in outside views
+    replaySkipIntro: true,      // start a moment before the first note
+    replayShowMisses: true,     // red marks on the timeline
+    freeCam: null,              // last free-camera position {tx,ty,tz,yaw,pitch,dist}
 };
+
+// Every camera / replay option, with its default (for "Reset to defaults")
+export const CAMERA_KEYS = ['camFov', 'camHeight', 'camDistance', 'camTilt',
+    'fpFov', 'fpPosSmooth', 'fpRotSmooth', 'fpLevelHorizon', 'fpOffsetBack', 'fpOffsetUp',
+    'followDistance', 'followHeight', 'followSmooth'];
+export const REPLAY_KEYS = ['replayCamera', 'replayHud', 'replayCutText', 'replayHitSounds', 'replayStats',
+    'replayHead', 'replaySkipIntro', 'replayShowMisses', 'trailLength', 'freeCam'];
+export const defaultSetting = (key) => DEFAULTS[key];
 
 class Settings {
     constructor() {
@@ -25,6 +64,16 @@ class Settings {
         } catch (e) { /* fresh start */ }
     }
     get(key) { return this.data[key]; }
+    // a number setting, falling back to its default when missing or invalid
+    num(key, min = -Infinity, max = Infinity) {
+        let v = Number(this.data[key]);
+        if (!Number.isFinite(v)) v = Number(DEFAULTS[key]) || 0;
+        return Math.min(max, Math.max(min, v));
+    }
+    reset(keys) {
+        for (const k of keys) this.data[k] = DEFAULTS[k];
+        try { localStorage.setItem('saber3d_settings', JSON.stringify(this.data)); } catch (e) { /* private mode */ }
+    }
     set(key, value) {
         this.data[key] = value;
         try { localStorage.setItem('saber3d_settings', JSON.stringify(this.data)); } catch (e) { /* private mode */ }

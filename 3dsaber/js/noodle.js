@@ -277,8 +277,35 @@ export class TrackSystem {
 
     markEnv(name) {
         const tr = this.track(name);
+        tr.isEnv = true;
         if (tr.kind === KIND.OBJECT) tr.kind = KIND.ENV;
         return tr;
+    }
+
+    // Back to how things were before the first custom event (replay seeking);
+    // the next update(t) re-applies every event up to t.
+    reset() {
+        for (const tr of this.tracks.values()) {
+            tr.values = {};
+            tr.paths = {};
+            tr.pathFrom = {};
+            tr.kind = tr.isEnv ? KIND.ENV : KIND.OBJECT;
+            const g = tr.group;
+            if (g.parent !== this.root) this.root.add(g);
+            g.position.set(0, 0, 0);
+            g.quaternion.identity();
+            g.scale.set(1, 1, 1);
+        }
+        this.evIdx = 0;
+        this.active.clear();
+        this.playerTargets = {};
+        this.fogTrackName = null;
+        for (const target in this.rigs) {
+            const rig = this.rigs[target], base = this.rigBase[target];
+            if (!rig || !base) continue;
+            rig.position.copy(base.pos);
+            rig.quaternion.copy(base.quat);
+        }
     }
 
     _setValue(tr, prop, points, t) {
