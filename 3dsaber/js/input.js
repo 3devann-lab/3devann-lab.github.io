@@ -7,6 +7,7 @@ const DEADZONE = 0.14;
 export const Buttons = {
     CONFIRM: 0,
     BACK: 1,
+    Y: 3,
     START: 9,
     DPAD_UP: 12,
     DPAD_DOWN: 13,
@@ -149,9 +150,9 @@ class VirtualCursor {
         return null;
     }
 
+    // the main loop polls the gamepad once per frame before calling this
     update(dt) {
         if (!this.enabled) return;
-        gamepad.poll();
 
         const rs = gamepad.rightStick;
         if (rs.x !== 0 || rs.y !== 0) {

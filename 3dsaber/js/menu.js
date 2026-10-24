@@ -1,11 +1,19 @@
-// ============ Menu system: screens, BeatSaver browser, pause/results ============
+// ============ Menu system: screens, BeatSaver browser, replays, pause/results ============
 import { audio } from './audio.js';
 import { gamepad, cursor } from './input.js';
-import { settings, getHighScore, setHighScore, getBestForMap } from './settings.js';
-import { searchMaps, downloadMap, getSavedMaps, getSavedMap, deleteSavedMap } from './beatsaver.js';
+import { settings, getHighScore, setHighScore, getBestScores } from './settings.js';
+import {
+    searchMaps, downloadMap, getSavedMaps, getSavedMap, deleteSavedMap,
+    getSavedIds, findSavedByHash, getMapByHash,
+} from './beatsaver.js';
 import { parseDifficulty } from './beatmap.js';
 import { generateBuiltinBeatmap, BUILTIN_SONG } from './builtin.js';
 import { Gameplay } from './game.js';
+import { decodeBsor, matchReplay, replaySpeed, replayModifiers } from './bsor.js';
+import {
+    searchPlayers, getPlayerScores, searchLevels, getLeaderboard, getReplayUrl,
+    getScoreById, fetchReplay, parseReplayLink, countryFlag,
+} from './beatleader.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -14,7 +22,7 @@ export function toast(msg, type = '') {
     el.className = 'toast ' + type;
     el.textContent = msg;
     $('toast-container').appendChild(el);
-    setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 350); }, 2600);
+    setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 350); }, type === 'error' ? 4200 : 2600);
 }
 
 function esc(s) {
@@ -27,6 +35,22 @@ function fmtDuration(sec) {
     return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+function fmtDate(unix) {
+    if (!unix) return '';
+    const d = new Date(unix * 1000);
+    const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+    if (days < 1) return 'today';
+    if (days < 2) return 'yesterday';
+    if (days < 30) return `${days} days ago`;
+    return d.toLocaleDateString();
+}
+
+const DIFF_LABEL = { Easy: 'Easy', Normal: 'Normal', Hard: 'Hard', Expert: 'Expert', ExpertPlus: 'Expert+' };
+const MODE_ALIASES = {
+    Standard: ['Standard'], OneSaber: ['OneSaber'], NoArrows: ['NoArrows'],
+    '90Degree': ['90Degree'], '360Degree': ['360Degree'], Lawless: ['Lawless'], Lightshow: ['Lightshow'],
+};
+
 export class Menu {
     constructor(engine) {
         this.engine = engine;
@@ -34,7 +58,14 @@ export class Menu {
         this.gameplay = null;
         this.currentLevel = null;   // remembered for retry
         this.builtinBuffer = null;
+        this.audioCache = null;     // { id, buffer } — last decoded song (retries are instant)
         this.browseState = { query: '', sort: 'Rating', page: 0 };
+        this.replayUi = {
+            tab: 'players', playerQuery: '', players: null, player: null,
+            scoreQuery: '', scoreSort: 'date', scorePage: 1,
+            levelQuery: '', levels: null, level: null, lb: null, lbPage: 1,
+        };
+        this.objectUrls = [];
 
         gamepad.on('connect', () => {
             this.updateControllerChip();
@@ -46,19 +77,37 @@ export class Menu {
         gamepad.on('disconnect', () => {
             this.updateControllerChip();
             toast('Controller disconnected', 'error');
-            if (this.gameplay && !this.gameplay.paused && !this.gameplay.finished) this.pauseGame();
+            if (this.gameplay && !this.gameplay.replay && !this.gameplay.paused && !this.gameplay.finished) this.pauseGame();
         });
 
         window.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && this.gameplay && !this.gameplay.finished) {
-                this.gameplay.paused ? this.resumeGame() : this.pauseGame();
+            if (e.target && e.target.matches && e.target.matches('input[type="text"], input[type="search"], input[type="url"]')) return;
+            const gp = this.gameplay;
+            if (!gp || gp.finished) return;
+            if (e.key === 'Escape' || (gp.replay && e.key === ' ')) {
+                e.preventDefault();
+                gp.paused ? this.resumeGame() : this.pauseGame();
+            } else if (gp.replay && (e.key === 'c' || e.key === 'C') && !gp.paused) {
+                this.toggleReplayCamera();
             }
+        });
+
+        // pause automatically when the tab is hidden (audio clock keeps running otherwise)
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden && this.gameplay && !this.gameplay.paused && !this.gameplay.finished) this.pauseGame();
         });
 
         // click sounds for all UI buttons
         this.root.addEventListener('click', (e) => {
             if (e.target.closest('button, .btn, .song-row, .toggle, .diff-btn')) audio.playClick();
         });
+    }
+
+    // free cover-image blob URLs from the previous screen
+    setScreen(html) {
+        for (const u of this.objectUrls) URL.revokeObjectURL(u);
+        this.objectUrls = [];
+        this.root.innerHTML = html;
     }
 
     updateControllerChip() {
@@ -78,7 +127,7 @@ export class Menu {
 
     // ============ HOME ============
     showHome() {
-        this.root.innerHTML = `
+        this.setScreen(`
         <div class="screen">
             <div id="controller-chip"><span class="dot"></span><span>Connect a controller</span></div>
             <h1 id="title">SABER//3D</h1>
@@ -86,19 +135,21 @@ export class Menu {
             <div class="menu-buttons">
                 <button class="btn primary" id="btn-play">Play</button>
                 <button class="btn" id="btn-custom">Custom Levels</button>
+                <button class="btn" id="btn-replays">Replays</button>
                 <button class="btn" id="btn-settings">Settings</button>
             </div>
-        </div>`;
+        </div>`);
         this.updateControllerChip();
         this.enterMenuMode(null);
         $('btn-play').onclick = () => this.showSongs();
         $('btn-custom').onclick = () => this.showBrowse();
+        $('btn-replays').onclick = () => this.showReplays();
         $('btn-settings').onclick = () => this.showSettings();
     }
 
     // ============ SONG LIST (Play) ============
     async showSongs() {
-        this.root.innerHTML = `
+        this.setScreen(`
         <div class="screen panel-screen">
             <div class="panel">
                 <div class="panel-header">
@@ -107,13 +158,15 @@ export class Menu {
                 </div>
                 <div class="panel-body" id="song-list"><div class="loading-spinner"></div></div>
             </div>
-        </div>`;
+        </div>`);
         this.enterMenuMode(() => this.showHome());
         $('btn-back').onclick = () => this.showHome();
 
         const list = $('song-list');
         const saved = await getSavedMaps().catch(() => []);
+        if (!list.isConnected) return;
         list.innerHTML = '';
+        const best = getBestScores();
 
         // Built-in track
         list.appendChild(this.songRow({
@@ -122,12 +175,13 @@ export class Menu {
             artist: BUILTIN_SONG.songAuthor,
             mapper: BUILTIN_SONG.mapper,
             badges: '<span class="badge builtin">Built-in</span>',
-            best: getBestForMap(BUILTIN_SONG.id),
+            best: best.get(BUILTIN_SONG.id),
             onClick: () => this.showDifficultyModal(BUILTIN_SONG, null),
         }));
 
         for (const rec of saved) {
-            const coverUrl = rec.coverBlob ? URL.createObjectURL(rec.coverBlob) : (rec.meta?.coverURL || null);
+            let coverUrl = rec.meta?.coverURL || null;
+            if (rec.coverBlob) { coverUrl = URL.createObjectURL(rec.coverBlob); this.objectUrls.push(coverUrl); }
             const badges =
                 (rec.meta?.hasChroma ? '<span class="badge chroma">Chroma</span>' : '') +
                 (rec.meta?.hasNoodle ? '<span class="badge noodle">Noodle</span>' : '');
@@ -137,10 +191,11 @@ export class Menu {
                 artist: rec.info.songAuthor,
                 mapper: rec.info.levelAuthor || rec.meta?.mapper || '',
                 badges,
-                best: getBestForMap(rec.id),
+                best: best.get(rec.id),
                 onClick: () => this.showDifficultyModal(null, rec),
                 onDelete: async () => {
                     await deleteSavedMap(rec.id);
+                    if (this.audioCache && this.audioCache.id === rec.id) this.audioCache = null;
                     toast('Map deleted');
                     this.showSongs();
                 },
@@ -159,7 +214,7 @@ export class Menu {
         const row = document.createElement('div');
         row.className = 'song-row';
         row.innerHTML = `
-            ${cover ? `<img class="song-cover" src="${cover}" alt="">` : '<div class="song-cover"></div>'}
+            ${cover ? `<img class="song-cover" src="${esc(cover)}" alt="" loading="lazy">` : '<div class="song-cover"></div>'}
             <div class="song-meta">
                 <div class="song-name">${esc(name)}</div>
                 <div class="song-artist">${esc(artist)}</div>
@@ -167,7 +222,7 @@ export class Menu {
             </div>
             <div class="song-right">
                 <div class="badges">${badges || ''}</div>
-                ${best ? `<div class="song-hs">Best <b>${best.score.toLocaleString()}</b> · ${best.rank}</div>` : ''}
+                ${best ? `<div class="song-hs">Best <b>${best.score.toLocaleString()}</b> · ${esc(best.rank)}</div>` : ''}
                 ${onDelete ? '<button class="btn small danger row-delete">Delete</button>' : ''}
             </div>`;
         row.onclick = (e) => {
@@ -200,7 +255,7 @@ export class Menu {
                         const hs = getHighScore(builtinSong ? builtinSong.id : record.id, d.characteristic, d.difficulty);
                         return `<button class="diff-btn diff-${esc(d.difficulty)}" data-i="${i}">
                             <span>${esc(d.label || d.difficulty)}</span>
-                            <span class="diff-stats">NJS ${d.njs}${hs ? ` · Best ${hs.score.toLocaleString()} (${hs.rank})` : ''}</span>
+                            <span class="diff-stats">NJS ${esc(d.njs)}${hs ? ` · Best ${hs.score.toLocaleString()} (${esc(hs.rank)})` : ''}</span>
                         </button>`;
                     }).join('')}
                 </div>
@@ -228,13 +283,20 @@ export class Menu {
         cursor.onBack = close;
     }
 
+    async decodeSong(record) {
+        if (this.audioCache && this.audioCache.id === record.id) return this.audioCache.buffer;
+        const buffer = await audio.decode(record.songBuf);
+        this.audioCache = { id: record.id, buffer };
+        return buffer;
+    }
+
     // ============ START / END LEVEL ============
-    async startLevel(builtinSong, record, diff) {
-        if (!gamepad.connected) {
+    async startLevel(builtinSong, record, diff, replayCtx = null) {
+        if (!replayCtx && !gamepad.connected) {
             toast('Connect a controller to play — sabers are the thumbsticks', 'error');
             return;
         }
-        this.root.innerHTML = '<div class="screen"><div class="loading-spinner"></div></div>';
+        this.setScreen('<div class="screen"><div class="loading-spinner"></div></div>');
         try {
             let mapData, songBuffer, songName, bpm, mapId;
 
@@ -245,25 +307,42 @@ export class Menu {
                 }
                 songBuffer = this.builtinBuffer;
                 mapData = generateBuiltinBeatmap(songBuffer.duration, diff.difficulty);
+                mapData.customEvents = []; mapData.environment = [];
                 songName = `${BUILTIN_SONG.songName} — ${BUILTIN_SONG.songAuthor}`;
                 bpm = BUILTIN_SONG.bpm;
                 mapId = BUILTIN_SONG.id;
             } else {
-                songBuffer = await audio.decode(record.songBuf);
+                songBuffer = await this.decodeSong(record);
                 const raw = record.diffFiles[diff.filename];
                 if (!raw) throw new Error('Difficulty file missing from download');
                 const lightshow = diff.lightshowFilename ? record.diffFiles[diff.lightshowFilename] : null;
-                mapData = parseDifficulty(raw, record.info.bpm, lightshow);
+                mapData = parseDifficulty(raw, record.info.bpm, lightshow, record.diffFiles.__bpm || null);
                 songName = `${record.info.songName} — ${record.info.songAuthor}`;
                 bpm = record.info.bpm;
                 mapId = record.id;
             }
 
-            this.currentLevel = { builtinSong, record, diff };
-            this.root.innerHTML = '';
+            let replay = null;
+            if (replayCtx) {
+                const data = replayCtx.data;
+                const match = matchReplay(data, mapData);
+                if (match.noteEvents.size === 0 && data.notes.length > 0) {
+                    throw new Error('Replay does not match this map version');
+                }
+                replay = {
+                    data, match,
+                    playerName: replayCtx.playerName || data.info.playerName,
+                    speed: replaySpeed(data.info),
+                    mods: replayModifiers(data.info),
+                };
+            }
+
+            this.currentLevel = { builtinSong, record, diff, replayCtx };
+            this.setScreen('');
             cursor.disable();
             $('hint-bar').classList.add('hidden');
             $('hud').classList.remove('hidden');
+            $('replay-hint').classList.toggle('hidden', !replay);
 
             this.gameplay = new Gameplay(this.engine, mapData, songBuffer, {
                 songName,
@@ -271,88 +350,110 @@ export class Menu {
                 offsetBeats: diff.offset,
                 bpm,
                 mapId,
+                replay,
                 onEnd: (results) => this.endLevel(results, mapId, diff),
             });
             this.engine.gameplay = this.gameplay;
         } catch (err) {
             console.error(err);
             toast('Failed to start level: ' + err.message, 'error');
-            this.showSongs();
+            this.abortGameplay();
+            if (replayCtx) this.showReplays(); else this.showSongs();
         }
     }
 
     endLevel(results, mapId, diff) {
-        const isNewBest = !results.failed && setHighScore(mapId, diff.characteristic, diff.difficulty, results);
+        const isReplay = !!results.replay;
+        const isNewBest = !isReplay && !results.failed && setHighScore(mapId, diff.characteristic, diff.difficulty, results);
         this.engine.gameplay = null;
         if (this.gameplay) { this.gameplay.destroy(); this.gameplay = null; }
         $('hud').classList.add('hidden');
+        $('replay-hint').classList.add('hidden');
         this.showResults(results, isNewBest);
     }
 
     showResults(r, isNewBest) {
-        this.root.innerHTML = `
+        const rc = this.currentLevel && this.currentLevel.replayCtx;
+        const who = rc ? esc(rc.playerName || rc.data.info.playerName || 'Player') : '';
+        this.setScreen(`
         <div class="screen">
             <div class="modal" style="width:min(520px,92vw)">
+                ${rc ? `<div class="result-kicker">REPLAY · ${who}</div>` : ''}
                 ${r.failed
                     ? '<div class="result-title failed">LEVEL FAILED</div>'
-                    : `<div class="result-rank">${r.rank}</div>
+                    : `<div class="result-rank">${esc(r.rank)}</div>
                        <div class="result-title">${r.fullCombo ? 'FULL COMBO!' : 'LEVEL CLEARED'}</div>`}
                 <div class="result-grid">
                     <div class="result-stat"><div class="val ${isNewBest ? 'new-hs' : ''}">${r.score.toLocaleString()}</div><div class="lbl">${isNewBest ? 'New Best!' : 'Score'}</div></div>
-                    <div class="result-stat"><div class="val">${(r.accuracy * 100).toFixed(1)}%</div><div class="lbl">Accuracy</div></div>
+                    <div class="result-stat"><div class="val">${(r.accuracy * 100).toFixed(rc ? 2 : 1)}%</div><div class="lbl">Accuracy</div></div>
                     <div class="result-stat"><div class="val">${r.maxCombo}</div><div class="lbl">Max Combo</div></div>
                     <div class="result-stat"><div class="val">${r.hits} / ${r.hits + r.misses}</div><div class="lbl">Notes Hit</div></div>
                 </div>
                 <div class="menu-buttons" style="width:100%">
-                    <button class="btn primary" id="btn-retry">Retry</button>
-                    <button class="btn" id="btn-continue">Song Select</button>
+                    <button class="btn primary" id="btn-retry">${rc ? 'Watch Again' : 'Retry'}</button>
+                    <button class="btn" id="btn-continue">${rc ? 'Back to Replays' : 'Song Select'}</button>
                     <button class="btn" id="btn-home">Main Menu</button>
                 </div>
             </div>
-        </div>`;
-        this.enterMenuMode(() => this.showSongs());
+        </div>`);
+        this.enterMenuMode(() => (rc ? this.showReplays() : this.showSongs()));
         $('btn-retry').onclick = () => {
-            const { builtinSong, record, diff } = this.currentLevel;
-            this.startLevel(builtinSong, record, diff);
+            const { builtinSong, record, diff, replayCtx } = this.currentLevel;
+            this.startLevel(builtinSong, record, diff, replayCtx);
         };
-        $('btn-continue').onclick = () => this.showSongs();
+        $('btn-continue').onclick = () => (rc ? this.showReplays() : this.showSongs());
         $('btn-home').onclick = () => this.showHome();
     }
 
     // ============ PAUSE ============
     pauseGame() {
         if (!this.gameplay || this.gameplay.finished) return;
-        this.gameplay.pause();
-        this.root.innerHTML = `
+        const gp = this.gameplay;
+        gp.pause();
+        const isReplay = !!gp.replay;
+        this.setScreen(`
         <div class="screen">
             <div class="modal" style="width:min(400px,90vw)">
                 <div class="result-title">PAUSED</div>
                 <div class="menu-buttons" style="width:100%">
                     <button class="btn primary" id="btn-resume">Resume</button>
-                    <button class="btn" id="btn-restart">Restart</button>
-                    <button class="btn danger" id="btn-quit">Quit to Menu</button>
+                    ${isReplay ? `<button class="btn" id="btn-camera">Camera: ${gp.camMode === 'first' ? 'First Person' : 'Third Person'}</button>` : ''}
+                    <button class="btn" id="btn-restart">${isReplay ? 'Restart Replay' : 'Restart'}</button>
+                    <button class="btn danger" id="btn-quit">${isReplay ? 'Quit to Replays' : 'Quit to Menu'}</button>
                 </div>
             </div>
-        </div>`;
+        </div>`);
         this.enterMenuMode(() => this.resumeGame());
         $('btn-resume').onclick = () => this.resumeGame();
+        if (isReplay) {
+            $('btn-camera').onclick = () => {
+                const mode = gp.toggleCamera();
+                $('btn-camera').textContent = `Camera: ${mode === 'first' ? 'First Person' : 'Third Person'}`;
+            };
+        }
         $('btn-restart').onclick = () => {
             this.abortGameplay();
-            const { builtinSong, record, diff } = this.currentLevel;
-            this.startLevel(builtinSong, record, diff);
+            const { builtinSong, record, diff, replayCtx } = this.currentLevel;
+            this.startLevel(builtinSong, record, diff, replayCtx);
         };
         $('btn-quit').onclick = () => {
             this.abortGameplay();
-            this.showHome();
+            if (isReplay) this.showReplays(); else this.showHome();
         };
     }
 
     resumeGame() {
         if (!this.gameplay) return;
-        this.root.innerHTML = '';
+        this.setScreen('');
         cursor.disable();
         $('hint-bar').classList.add('hidden');
         this.gameplay.resume();
+    }
+
+    toggleReplayCamera() {
+        if (!this.gameplay || !this.gameplay.replay) return;
+        const mode = this.gameplay.toggleCamera();
+        toast(mode === 'first' ? 'Camera: first person (player\'s view)' : 'Camera: third person');
     }
 
     abortGameplay() {
@@ -363,13 +464,14 @@ export class Menu {
         }
         this.engine.gameplay = null;
         $('hud').classList.add('hidden');
+        $('replay-hint').classList.add('hidden');
         $('countdown').classList.add('hidden');
     }
 
     // ============ CUSTOM LEVELS (BeatSaver) ============
     showBrowse() {
         const st = this.browseState;
-        this.root.innerHTML = `
+        this.setScreen(`
         <div class="screen panel-screen">
             <div class="panel">
                 <div class="panel-header">
@@ -385,7 +487,7 @@ export class Menu {
                 </div>
                 <div class="panel-body" id="browse-results"><div class="loading-spinner"></div></div>
             </div>
-        </div>`;
+        </div>`);
         this.enterMenuMode(() => this.showHome());
         $('btn-back').onclick = () => this.showHome();
 
@@ -415,7 +517,10 @@ export class Menu {
         if (!box) return;
         box.innerHTML = '<div class="loading-spinner"></div>';
         try {
-            const maps = await searchMaps({ query: st.query, page: st.page, sort: st.sort });
+            const [maps, savedIds] = await Promise.all([
+                searchMaps({ query: st.query, page: st.page, sort: st.sort }),
+                getSavedIds().catch(() => new Set()),
+            ]);
             if (!box.isConnected) return;
             if (maps.length === 0) {
                 box.innerHTML = '<div class="browse-msg">No maps found. Try a different search.</div>';
@@ -427,7 +532,7 @@ export class Menu {
                     <button class="btn small" id="pg-next">Next →</button>
                 </div>`;
             const grid = box.querySelector('.map-grid');
-            for (const m of maps) grid.appendChild(await this.mapCard(m));
+            for (const m of maps) grid.appendChild(this.mapCard(m, savedIds.has(m.id)));
             const prev = $('pg-prev'), next = $('pg-next');
             if (prev) prev.onclick = () => { st.page--; this.loadBrowseResults(); box.scrollTop = 0; };
             if (next) next.onclick = () => { st.page++; this.loadBrowseResults(); box.scrollTop = 0; };
@@ -437,7 +542,7 @@ export class Menu {
         }
     }
 
-    async mapCard(m) {
+    mapCard(m, saved) {
         const card = document.createElement('div');
         card.className = 'map-card';
         const diffNames = [...new Set(m.diffs.map(d => d.difficulty))];
@@ -464,7 +569,6 @@ export class Menu {
             </div>`;
 
         const btn = card.querySelector('.dl-btn');
-        const saved = await getSavedMap(m.id).catch(() => null);
         if (saved) this.markDownloaded(btn, m.id);
         else {
             btn.onclick = async () => {
@@ -506,10 +610,395 @@ export class Menu {
         };
     }
 
+    // ============ REPLAYS (BeatLeader) ============
+    showReplays(tab = null) {
+        const ui = this.replayUi;
+        if (tab) ui.tab = tab;
+        const tabBtn = (id, label) => `<button class="sort-btn ${ui.tab === id ? 'active' : ''}" data-tab="${id}">${label}</button>`;
+        this.setScreen(`
+        <div class="screen panel-screen">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">REPLAYS</div>
+                    <div class="browse-controls tabs">
+                        ${tabBtn('players', 'Players')}
+                        ${tabBtn('levels', 'Levels')}
+                        ${tabBtn('file', 'File / Link')}
+                    </div>
+                    <button class="btn small" id="btn-back">← Back</button>
+                </div>
+                <div class="panel-subheader" id="replay-controls"></div>
+                <div class="panel-body" id="replay-body"></div>
+            </div>
+        </div>`);
+        $('btn-back').onclick = () => this.replayBack();
+        this.enterMenuMode(() => this.replayBack());
+        this.root.querySelectorAll('[data-tab]').forEach(b => {
+            b.onclick = () => {
+                ui.tab = b.dataset.tab;
+                ui.player = null; ui.lb = null;
+                this.showReplays();
+            };
+        });
+        if (ui.tab === 'players') ui.player ? this.renderPlayerScores() : this.renderPlayerSearch();
+        else if (ui.tab === 'levels') ui.lb ? this.renderLeaderboard() : this.renderLevelSearch();
+        else this.renderReplayFile();
+    }
+
+    replayBack() {
+        const ui = this.replayUi;
+        if (ui.tab === 'players' && ui.player) { ui.player = null; this.showReplays(); }
+        else if (ui.tab === 'levels' && ui.lb) { ui.lb = null; this.showReplays(); }
+        else this.showHome();
+    }
+
+    searchBar(id, placeholder, value, onSearch, extra = '') {
+        const box = $('replay-controls');
+        box.innerHTML = `
+            <input class="search-box" id="${id}" type="text" placeholder="${esc(placeholder)}" value="${esc(value)}">
+            <button class="sort-btn" id="${id}-go">Search</button>
+            ${extra}`;
+        const input = $(id);
+        const go = () => onSearch(input.value);
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+        $(`${id}-go`).onclick = go;
+        return input;
+    }
+
+    blError(box, err) {
+        console.error(err);
+        box.innerHTML = `<div class="browse-msg">${esc(err.message)}
+            <br><br><button class="btn small" id="err-file">Open a replay file instead</button>
+            <button class="btn small" id="err-settings">Settings</button></div>`;
+        $('err-file').onclick = () => this.showReplays('file');
+        $('err-settings').onclick = () => this.showSettings();
+    }
+
+    // --- players ---
+    renderPlayerSearch() {
+        const ui = this.replayUi;
+        const body = $('replay-body');
+        const run = async (q) => {
+            ui.playerQuery = q;
+            if (!q.trim()) { ui.players = null; return this.renderPlayerList(); }
+            body.innerHTML = '<div class="loading-spinner"></div>';
+            try {
+                const r = await searchPlayers(q);
+                ui.players = r.players;
+                if (body.isConnected) this.renderPlayerList();
+            } catch (err) { if (body.isConnected) this.blError(body, err); }
+        };
+        const input = this.searchBar('player-search', 'Search a BeatLeader username…', ui.playerQuery, run);
+        this.renderPlayerList();
+        if (!ui.playerQuery) setTimeout(() => input.focus(), 50);
+    }
+
+    renderPlayerList() {
+        const ui = this.replayUi;
+        const body = $('replay-body');
+        if (!ui.players) {
+            body.innerHTML = `<div class="browse-msg">Search for a player to browse their scores and watch their replays.<br>
+                <small>Replays come from BeatLeader. Every score with a replay can be watched right here, played back with the real swings.</small></div>`;
+            return;
+        }
+        if (!ui.players.length) { body.innerHTML = '<div class="browse-msg">No players found.</div>'; return; }
+        body.innerHTML = '<div class="player-grid"></div>';
+        const grid = body.firstChild;
+        for (const p of ui.players) {
+            const card = document.createElement('div');
+            card.className = 'map-card player-card';
+            card.innerHTML = `
+                ${p.avatar ? `<img class="avatar" src="${esc(p.avatar)}" alt="" loading="lazy">` : '<div class="avatar"></div>'}
+                <div class="player-info">
+                    <div class="map-card-name">${esc(p.name)}</div>
+                    <div class="map-card-author">${countryFlag(p.country)} ${esc(p.country)} · #${p.rank.toLocaleString()}</div>
+                    <div class="map-card-mapper">${Math.round(p.pp).toLocaleString()} pp</div>
+                </div>`;
+            card.onclick = () => {
+                ui.player = p; ui.scoreQuery = ''; ui.scorePage = 1;
+                this.showReplays();
+            };
+            grid.appendChild(card);
+        }
+    }
+
+    renderPlayerScores() {
+        const ui = this.replayUi;
+        const p = ui.player;
+        const sorts = [['date', 'Recent'], ['pp', 'Top PP'], ['acc', 'Accuracy']];
+        const extra = sorts.map(([id, label]) =>
+            `<button class="sort-btn ${ui.scoreSort === id ? 'active' : ''}" data-ssort="${id}">${label}</button>`).join('');
+        this.searchBar('score-search', `Search ${p.name}'s levels…`, ui.scoreQuery, (q) => {
+            ui.scoreQuery = q; ui.scorePage = 1; this.loadPlayerScores();
+        }, extra);
+        $('replay-controls').insertAdjacentHTML('afterbegin', `
+            <div class="player-chip">${p.avatar ? `<img src="${esc(p.avatar)}" alt="">` : ''}<span>${esc(p.name)}</span></div>`);
+        this.root.querySelectorAll('[data-ssort]').forEach(b => {
+            b.onclick = () => {
+                ui.scoreSort = b.dataset.ssort; ui.scorePage = 1;
+                this.root.querySelectorAll('[data-ssort]').forEach(x => x.classList.toggle('active', x === b));
+                this.loadPlayerScores();
+            };
+        });
+        this.loadPlayerScores();
+    }
+
+    async loadPlayerScores() {
+        const ui = this.replayUi;
+        const body = $('replay-body');
+        if (!body) return;
+        body.innerHTML = '<div class="loading-spinner"></div>';
+        try {
+            const r = await getPlayerScores(ui.player, { search: ui.scoreQuery, sortBy: ui.scoreSort, page: ui.scorePage });
+            if (!body.isConnected) return;
+            if (!r.scores.length) {
+                body.innerHTML = `<div class="browse-msg">${ui.scoreQuery ? 'No scores match that search.' : 'This player has no scores yet.'}</div>`;
+                return;
+            }
+            this.renderScoreList(body, r.scores, { showSong: true }, r.total, ui.scorePage, (pg) => { ui.scorePage = pg; this.loadPlayerScores(); });
+        } catch (err) { if (body.isConnected) this.blError(body, err); }
+    }
+
+    // --- levels ---
+    renderLevelSearch() {
+        const ui = this.replayUi;
+        const body = $('replay-body');
+        const run = async (q) => {
+            ui.levelQuery = q;
+            if (!q.trim()) { ui.levels = null; return this.renderLevelList(); }
+            body.innerHTML = '<div class="loading-spinner"></div>';
+            try {
+                const r = await searchLevels(q);
+                ui.levels = r.levels;
+                if (body.isConnected) this.renderLevelList();
+            } catch (err) { if (body.isConnected) this.blError(body, err); }
+        };
+        const input = this.searchBar('level-search', 'Search levels (song, artist, mapper)…', ui.levelQuery, run);
+        this.renderLevelList();
+        if (!ui.levelQuery) setTimeout(() => input.focus(), 50);
+    }
+
+    renderLevelList() {
+        const ui = this.replayUi;
+        const body = $('replay-body');
+        if (!ui.levels) {
+            body.innerHTML = '<div class="browse-msg">Search for a level, pick a difficulty and watch the top players\' replays.</div>';
+            return;
+        }
+        if (!ui.levels.length) { body.innerHTML = '<div class="browse-msg">No levels found.</div>'; return; }
+        body.innerHTML = '<div class="map-grid"></div>';
+        const grid = body.firstChild;
+        for (const lv of ui.levels) {
+            const card = document.createElement('div');
+            card.className = 'map-card level-card';
+            card.innerHTML = `
+                <div class="map-card-top">
+                    <img class="song-cover" src="${esc(lv.song.cover)}" loading="lazy" alt="">
+                    <div class="map-card-info">
+                        <div class="map-card-name">${esc(lv.song.name)}</div>
+                        <div class="map-card-author">${esc(lv.song.author)}</div>
+                        <div class="map-card-mapper">${esc(lv.song.mapper)}</div>
+                    </div>
+                </div>
+                <div class="diff-chips">${lv.diffs.map((d, i) => `
+                    <button class="diff-chip diff-${esc(d.name)}" data-d="${i}" title="${d.plays} plays">
+                        ${d.mode !== 'Standard' ? esc(d.mode) + ' ' : ''}${esc(DIFF_LABEL[d.name] || d.name)}${d.stars ? ` ★${d.stars.toFixed(1)}` : ''}
+                    </button>`).join('')}</div>`;
+            card.querySelectorAll('[data-d]').forEach(b => {
+                b.onclick = () => {
+                    ui.level = lv; ui.lb = lv.diffs[Number(b.dataset.d)]; ui.lbPage = 1;
+                    this.showReplays();
+                };
+            });
+            grid.appendChild(card);
+        }
+    }
+
+    renderLeaderboard() {
+        const ui = this.replayUi;
+        const ctl = $('replay-controls');
+        ctl.innerHTML = `<div class="player-chip">${ui.level.song.cover ? `<img src="${esc(ui.level.song.cover)}" alt="">` : ''}
+            <span>${esc(ui.level.song.name)} · <b class="diff-${esc(ui.lb.name)}">${esc(DIFF_LABEL[ui.lb.name] || ui.lb.name)}</b></span></div>`;
+        this.loadLeaderboard();
+    }
+
+    async loadLeaderboard() {
+        const ui = this.replayUi;
+        const body = $('replay-body');
+        if (!body) return;
+        body.innerHTML = '<div class="loading-spinner"></div>';
+        try {
+            const r = await getLeaderboard(ui.lb.id, ui.lbPage);
+            if (!body.isConnected) return;
+            if (!r.scores.length) { body.innerHTML = '<div class="browse-msg">No scores on this difficulty yet.</div>'; return; }
+            this.renderScoreList(body, r.scores, { showPlayer: true }, r.total, ui.lbPage, (pg) => { ui.lbPage = pg; this.loadLeaderboard(); });
+        } catch (err) { if (body.isConnected) this.blError(body, err); }
+    }
+
+    renderScoreList(body, scores, { showSong = false, showPlayer = false }, total, page, onPage) {
+        body.innerHTML = '<div class="score-list"></div>';
+        const list = body.firstChild;
+        for (const s of scores) {
+            const row = document.createElement('div');
+            row.className = 'song-row score-row';
+            const diff = `<span class="diff-chip static diff-${esc(s.diff.name)}">${s.diff.mode !== 'Standard' ? esc(s.diff.mode) + ' ' : ''}${esc(DIFF_LABEL[s.diff.name] || s.diff.name)}</span>`;
+            row.innerHTML = `
+                ${showPlayer
+                    ? `<div class="score-rank">#${s.rank}</div>${s.playerAvatar ? `<img class="avatar small" src="${esc(s.playerAvatar)}" alt="" loading="lazy">` : '<div class="avatar small"></div>'}`
+                    : `<img class="song-cover" src="${esc(s.song.cover)}" alt="" loading="lazy">`}
+                <div class="song-meta">
+                    <div class="song-name">${showPlayer ? esc(s.playerName) : esc(s.song.name)}</div>
+                    <div class="song-artist">${showSong ? esc(s.song.author) + ' · ' : ''}${diff} ${s.modifiers ? `<span class="mods">${esc(s.modifiers)}</span>` : ''}</div>
+                    <div class="song-mapper">${showSong ? 'mapped by ' + esc(s.song.mapper) + ' · ' : ''}${esc(fmtDate(s.timeset))}</div>
+                </div>
+                <div class="song-right">
+                    <div class="score-acc">${(s.accuracy * 100).toFixed(2)}%</div>
+                    <div class="song-hs">${s.score.toLocaleString()} ${s.pp ? `· ${s.pp.toFixed(1)}pp` : ''}</div>
+                    <div class="badges">${s.fullCombo ? '<span class="badge fc">FC</span>' : `<span class="badge miss">${s.misses} miss${s.misses === 1 ? '' : 'es'}</span>`}</div>
+                </div>
+                <button class="dl-btn watch-btn">Watch ▶</button>`;
+            row.onclick = () => this.watchReplay({ score: s });
+            list.appendChild(row);
+        }
+        const pages = Math.max(1, Math.ceil((total || 0) / 20));
+        const pager = document.createElement('div');
+        pager.className = 'pager';
+        pager.innerHTML = `
+            ${page > 1 ? '<button class="btn small" data-pg="-1">← Prev</button>' : ''}
+            <span class="pager-info">Page ${page}${total ? ` of ${pages}` : ''}</span>
+            ${scores.length >= 20 && page < pages ? '<button class="btn small" data-pg="1">Next →</button>' : ''}`;
+        pager.querySelectorAll('[data-pg]').forEach(b => { b.onclick = () => { onPage(page + Number(b.dataset.pg)); body.scrollTop = 0; }; });
+        body.appendChild(pager);
+    }
+
+    // --- file / link ---
+    renderReplayFile() {
+        $('replay-controls').innerHTML = '';
+        const body = $('replay-body');
+        body.innerHTML = `
+            <div class="file-drop" id="file-drop">
+                <div class="file-drop-icon">⤓</div>
+                <div><b>Drop a .bsor replay here</b> or</div>
+                <button class="btn small" id="file-pick">Choose File…</button>
+                <input type="file" id="file-input" accept=".bsor" hidden>
+            </div>
+            <div class="link-row">
+                <input class="search-box" id="link-input" type="text" placeholder="…or paste a BeatLeader replay link / score ID">
+                <button class="btn small primary" id="link-go">Watch ▶</button>
+            </div>
+            <div class="browse-msg small-msg">Replay files and links work without the BeatLeader API. The map is downloaded from BeatSaver automatically.</div>`;
+        const input = $('file-input');
+        $('file-pick').onclick = () => input.click();
+        input.onchange = async () => {
+            const f = input.files && input.files[0];
+            if (f) this.watchReplay({ buffer: await f.arrayBuffer() });
+        };
+        const drop = $('file-drop');
+        drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+        drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+        drop.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            drop.classList.remove('over');
+            const f = e.dataTransfer.files && e.dataTransfer.files[0];
+            if (f) this.watchReplay({ buffer: await f.arrayBuffer() });
+        });
+        const link = $('link-input');
+        const go = () => {
+            const parsed = parseReplayLink(link.value);
+            if (!parsed) { toast('That doesn\'t look like a replay link or score ID', 'error'); return; }
+            this.watchReplay(parsed);
+        };
+        link.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+        $('link-go').onclick = go;
+    }
+
+    // ============ WATCH A REPLAY ============
+    // source: {score} from a list, {url}, {scoreId}, or {buffer} (local file)
+    async watchReplay(source) {
+        const backdrop = document.createElement('div');
+        backdrop.className = 'modal-backdrop';
+        backdrop.innerHTML = `
+            <div class="modal">
+                <h2>Loading replay</h2>
+                <div class="sub" id="rl-step">Preparing…</div>
+                <div class="dl-progress big"><div class="dl-progress-fill" id="rl-fill"></div></div>
+                <button class="btn small modal-close" id="rl-cancel">Cancel</button>
+            </div>`;
+        document.body.appendChild(backdrop);
+        let cancelled = false;
+        const prevBack = cursor.onBack;
+        const close = () => { backdrop.remove(); cursor.onBack = prevBack; };
+        backdrop.querySelector('#rl-cancel').onclick = () => { cancelled = true; close(); };
+        cursor.onBack = () => { cancelled = true; close(); };
+        const step = (label, p) => {
+            backdrop.querySelector('#rl-step').textContent = label;
+            if (p != null) backdrop.querySelector('#rl-fill').style.width = Math.round(p * 100) + '%';
+        };
+
+        try {
+            // 1. the replay file
+            let buffer = source.buffer || null;
+            let playerName = source.score ? source.score.playerName : '';
+            if (!buffer) {
+                let url = source.url || null;
+                let score = source.score || null;
+                if (!url && source.scoreId) {
+                    step('Looking up score…', 0.02);
+                    score = await getScoreById(source.scoreId);
+                    playerName = score.playerName;
+                }
+                if (!url) url = await getReplayUrl(score);
+                step('Downloading replay…', 0.05);
+                try {
+                    buffer = await fetchReplay(url, (p) => step('Downloading replay…', 0.05 + p * 0.25));
+                } catch (err) {
+                    // a constructed CDN name can miss — ask the API for the exact one
+                    if (err.status !== 404 || !score || score.replay) throw err;
+                    const full = await getScoreById(score.id);
+                    if (!full.replay) throw new Error('This score has no replay');
+                    buffer = await fetchReplay(full.replay, (p) => step('Downloading replay…', 0.05 + p * 0.25));
+                }
+            }
+            if (cancelled) return;
+            step('Reading replay…', 0.32);
+            const data = decodeBsor(buffer);
+            const info = data.info;
+            if (!playerName) playerName = info.playerName;
+
+            // 2. the map (by hash, from the library or BeatSaver)
+            step('Finding the map…', 0.35);
+            let record = await findSavedByHash(info.hash).catch(() => null);
+            if (!record) {
+                const meta = await getMapByHash(info.hash);
+                if (!meta) throw new Error('That map isn\'t on BeatSaver (it may have been deleted)');
+                if (cancelled) return;
+                record = await downloadMap(meta, (p, label) => step(label === 'Done' ? 'Map ready' : label + ' (map)', 0.35 + p * 0.55));
+            }
+            if (cancelled) return;
+
+            // 3. the difficulty that was played
+            const want = (info.mode || 'Standard').replace(/^Generated/, '');
+            const diffs = record.info.difficulties;
+            const modes = MODE_ALIASES[want] || [want];
+            const diff = diffs.find(d => modes.includes(d.characteristic) && d.difficulty === info.difficulty)
+                || diffs.find(d => d.difficulty === info.difficulty)
+                || null;
+            if (!diff) throw new Error(`The map has no ${info.difficulty} ${want} difficulty`);
+
+            step('Starting…', 1);
+            close();
+            this.startLevel(null, record, diff, { data, playerName });
+        } catch (err) {
+            console.error(err);
+            close();
+            if (!cancelled) toast('Couldn\'t load replay: ' + err.message, 'error');
+        }
+    }
+
     // ============ SETTINGS ============
     showSettings() {
         const s = settings;
-        this.root.innerHTML = `
+        this.setScreen(`
         <div class="screen panel-screen">
             <div class="panel" style="max-width:720px">
                 <div class="panel-header">
@@ -518,7 +1007,7 @@ export class Menu {
                 </div>
                 <div class="panel-body" id="settings-body"></div>
             </div>
-        </div>`;
+        </div>`);
         this.enterMenuMode(() => this.showHome());
         $('btn-back').onclick = () => this.showHome();
 
@@ -574,6 +1063,33 @@ export class Menu {
             body.appendChild(row);
         };
 
+        const choice = (key, label, sub, options, onChange) => {
+            const row = document.createElement('div');
+            row.className = 'setting-row';
+            row.innerHTML = `
+                <div class="setting-label">${label}<small>${sub}</small></div>
+                <div class="setting-control seg">${options.map(([v, l]) =>
+                    `<button class="sort-btn ${s.get(key) === v ? 'active' : ''}" data-v="${v}">${l}</button>`).join('')}</div>`;
+            row.querySelectorAll('[data-v]').forEach(b => {
+                b.onclick = () => {
+                    s.set(key, b.dataset.v);
+                    row.querySelectorAll('[data-v]').forEach(x => x.classList.toggle('active', x === b));
+                    if (onChange) onChange(b.dataset.v);
+                };
+            });
+            body.appendChild(row);
+        };
+
+        const text = (key, label, sub, placeholder) => {
+            const row = document.createElement('div');
+            row.className = 'setting-row';
+            row.innerHTML = `
+                <div class="setting-label">${label}<small>${sub}</small></div>
+                <div class="setting-control"><input class="search-box setting-text" type="text" placeholder="${esc(placeholder)}" value="${esc(s.get(key) || '')}"></div>`;
+            row.querySelector('input').onchange = (e) => { s.set(key, e.target.value.trim()); toast('Saved'); };
+            body.appendChild(row);
+        };
+
         const pct = (v) => Math.round(v * 100) + '%';
         slider('musicVolume', 'Music Volume', 'Song playback level', 0, 1, 0.05, pct);
         slider('sfxVolume', 'Effects Volume', 'Hit sounds and UI', 0, 1, 0.05, pct);
@@ -583,8 +1099,12 @@ export class Menu {
         color('leftColor', 'Left Saber Color', 'Also tints left-hand notes');
         color('rightColor', 'Right Saber Color', 'Also tints right-hand notes');
         toggle('noFail', 'No Fail', 'Never fail a song — chill mode', null);
+        choice('quality', 'Graphics Quality', 'Auto lowers resolution when frames run slow',
+            [['auto', 'Auto'], ['high', 'High'], ['medium', 'Medium'], ['low', 'Low']],
+            (v) => this.engine.setQuality(v));
         toggle('bloom', 'Glow / Bloom', 'Fancy graphics. Turn off on slow devices', (v) => this.engine.setBloom(v));
         toggle('wallDistortion', 'Wall Distortion', 'Real-time energy-field effect on walls', null);
         slider('bloomStrength', 'Glow Intensity', 'How strong the bloom glow is', 0, 1.2, 0.05, (v) => v.toFixed(2));
+        text('blProxy', 'BeatLeader Proxy', 'Optional — makes player/level search reliable (see proxy/README.md)', 'https://your-worker.workers.dev');
     }
 }

@@ -2,7 +2,7 @@
 // Supports v2.x, v3.x and v4.x beatmaps, Chroma colors, and Noodle Extensions:
 // coordinates, per-object NJS/offset, tracks, full animations, custom events
 // (AnimateTrack / AssignPathAnimation / AssignTrackParent / AssignPlayerToTrack),
-// fake notes/bombs/walls, world + local rotation.
+// fake notes/bombs/walls/chains, world + local rotation, angle offsets.
 // Pure JS (no DOM) so it can be tested headlessly.
 
 export const CUT_DIR = {
@@ -19,14 +19,29 @@ export const DIR_VECTORS = {
 
 const DIFF_ORDER = { Easy: 1, Normal: 3, Hard: 5, Expert: 7, ExpertPlus: 9 };
 
+function num(v, fallback = 0) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+}
+
 function normColor(c) {
     if (!Array.isArray(c) || c.length < 3) return null;
-    return [Number(c[0]) || 0, Number(c[1]) || 0, Number(c[2]) || 0];
+    return [num(c[0]), num(c[1]), num(c[2])];
+}
+
+// Chroma colors may carry alpha (brightness) as a 4th component
+function colorAlpha(c) {
+    return Array.isArray(c) && c.length >= 4 ? Math.max(0, num(c[3], 1)) : 1;
 }
 
 // ---------- Noodle helpers ----------
+// `position` is kept apart from `offsetPosition`: on gameplay objects both are
+// offsets (v2 `_position`), but on environment pieces / parent tracks / the
+// player, `position` is an absolute placement.
 const PROP_ALIASES = {
-    offsetPosition: ['offsetPosition', 'position', '_position'],
+    offsetPosition: ['offsetPosition'],
+    position: ['position', '_position'],
+    localPosition: ['localPosition', '_localPosition'],
     definitePosition: ['definitePosition', '_definitePosition'],
     rotation: ['rotation', 'offsetWorldRotation', 'worldRotation', '_rotation'],
     localRotation: ['localRotation', '_localRotation'],
@@ -47,18 +62,23 @@ function resolvePts(v, defs) {
     return v ?? null;
 }
 
-// Normalize an animation object (v2 underscore keys or v3 keys) into canonical props
-function normAnim(a, defs) {
-    if (!a) return null;
+// Normalize an animation object (v2 underscore keys or v3 keys) into canonical
+// props. With allowNull, an explicit `null` is kept so AnimateTrack /
+// AssignPathAnimation can clear a property (Heck behaviour).
+function normAnim(a, defs, allowNull = false) {
+    if (!a || typeof a !== 'object') return null;
     const out = {};
     let any = false;
     for (const prop in PROP_ALIASES) {
         for (const alias of PROP_ALIASES[prop]) {
-            if (a[alias] !== undefined) {
+            if (!(alias in a)) continue;
+            if (a[alias] === null) {
+                if (allowNull) { out[prop] = null; any = true; }
+            } else {
                 const pts = resolvePts(a[alias], defs);
                 if (pts !== null) { out[prop] = pts; any = true; }
-                break;
             }
+            break;
         }
     }
     return any ? out : null;
@@ -72,37 +92,66 @@ function normTrack(t) {
 // Static world rotation: number (y-axis degrees) or [x,y,z]
 function normWorldRot(r) {
     if (r == null) return null;
-    if (typeof r === 'number') return [0, r, 0];
-    if (Array.isArray(r)) return [r[0] || 0, r[1] || 0, r[2] || 0];
+    if (typeof r === 'number') return r ? [0, r, 0] : null;
+    if (Array.isArray(r)) return [num(r[0]), num(r[1]), num(r[2])];
     return null;
+}
+
+function normVec3(v) {
+    return Array.isArray(v) ? [num(v[0]), num(v[1]), num(v[2])] : null;
 }
 
 // Chroma environment enhancements: geometry objects ("custom models").
 // ID/regex lookups target base-game objects we don't have, so only
-// geometry-based entries are returned (that's what model maps use).
+// geometry-based entries are returned (that's what model maps use). Disabling
+// entries are inspected to decide whether the map wants the stock scenery gone.
+// Which of our stock scenery groups a disabled base-game object corresponds to
+const STOCK_GROUPS = {
+    floor: /Floor|Mirror|PlayersPlace|Construction|Platform/i,
+    strips: /Construction|NeonTube|BottomGlow/i,
+    back: /BackColumns|Buildings|Spectrogram|Logo|Frame|BackCube|Clouds/i,
+    towers: /RotatingLaser|SideLaser|(^|[^a-z])Laser/i,
+    lasers: /Laser/i,
+    rings: /Ring/i,
+};
+
 function parseEnvironment(cd, v2) {
     const list = (v2 ? cd._environment : cd.environment) || [];
     const mats = (v2 ? cd._materials : cd.materials) || {};
     const out = [];
+    const hide = new Set();
     for (const e of list) {
-        if ((v2 ? e._active : e.active) === false) continue;   // disabled entries
+        if (!e || typeof e !== 'object') continue;
+        const active = v2 ? e._active : e.active;
         const geo = v2 ? e._geometry : e.geometry;
-        if (!geo) continue;
+        if (!geo) {
+            const id = String((v2 ? e._id : e.id) ?? '');
+            if (active === false) {
+                if (/^(Environment|GameCore)$|^\.\*$/.test(id)) for (const g in STOCK_GROUPS) hide.add(g);
+                for (const g in STOCK_GROUPS) if (STOCK_GROUPS[g].test(id)) hide.add(g);
+            }
+            continue;
+        }
+        if (active === false) continue;
         let m = v2 ? geo._material : geo.material;
         if (typeof m === 'string') m = mats[m];
         m = m || {};
+        const color = v2 ? m._color : m.color;
         out.push({
             type: (v2 ? geo._type : geo.type) || 'Cube',
             shader: (v2 ? m._shader : m.shader) || 'Standard',
-            color: normColor(v2 ? m._color : m.color),
-            position: (v2 ? e._position : e.position) || null,
-            rotation: (v2 ? e._rotation : e.rotation) || null,
-            localPosition: (v2 ? e._localPosition : e.localPosition) || null,
-            localRotation: (v2 ? e._localRotation : e.localRotation) || null,
-            scale: (v2 ? e._scale : e.scale) || null,
+            color: normColor(color),
+            position: normVec3(v2 ? e._position : e.position),
+            rotation: normVec3(v2 ? e._rotation : e.rotation),
+            localPosition: normVec3(v2 ? e._localPosition : e.localPosition),
+            localRotation: normVec3(v2 ? e._localRotation : e.localRotation),
+            scale: normVec3(v2 ? e._scale : e.scale),
             track: normTrack(v2 ? e._track : e.track),
         });
     }
+    // big model maps bring their own world: hide all stock scenery
+    if (out.length >= 24) { for (const g in STOCK_GROUPS) hide.add(g); hide.add('stars'); }
+    out.hideGroups = [...hide];
     return out;
 }
 
@@ -114,7 +163,7 @@ function parseGradient(g, clock, beat) {
     if (!start || !end) return null;
     return {
         start, end,
-        duration: Math.max(0.01, clock.toSeconds(beat + (g._duration || 0)) - clock.toSeconds(beat)),
+        duration: Math.max(0.01, clock.toSeconds(beat + num(g._duration)) - clock.toSeconds(beat)),
         easing: g._easing || null,
     };
 }
@@ -127,7 +176,7 @@ function parseEventCustom(cd, v2) {
         rotation: pick('_rotation', 'rotation') ?? null,
         step: pick('_step', 'step') ?? null,
         prop: pick('_prop', 'prop') ?? null,
-        speed: pick('_speed', 'speed') ?? null,
+        speed: pick('_speed', 'speed') ?? (v2 ? cd._preciseSpeed ?? null : null),
         direction: pick('_direction', 'direction') ?? null,
     };
     return (custom.rotation !== null || custom.step !== null || custom.speed !== null ||
@@ -139,9 +188,9 @@ function parsePointDefs(cd, v2) {
     const defs = {};
     if (!cd) return defs;
     if (v2 && Array.isArray(cd._pointDefinitions)) {
-        for (const d of cd._pointDefinitions) if (d._name) defs[d._name] = d._points;
+        for (const d of cd._pointDefinitions) if (d && d._name) defs[d._name] = d._points;
     } else if (Array.isArray(cd.pointDefinitions)) {          // v3.0 – v3.2 array form
-        for (const d of cd.pointDefinitions) if (d.name) defs[d.name] = d.points;
+        for (const d of cd.pointDefinitions) if (d && d.name) defs[d.name] = d.points;
     } else if (cd.pointDefinitions && typeof cd.pointDefinitions === 'object') {
         Object.assign(defs, cd.pointDefinitions);             // v3.3+ object form
     }
@@ -152,19 +201,20 @@ function parsePointDefs(cd, v2) {
 function parseCustomEvents(list, clock, defs, v2) {
     const out = [];
     for (const ev of (list || [])) {
+        if (!ev) continue;
         const type = v2 ? ev._type : ev.t;
         const beat = v2 ? ev._time : ev.b;
         const d = (v2 ? ev._data : ev.d) || {};
         if (!type || beat === undefined) continue;
 
-        const durBeats = (v2 ? d._duration : d.duration) || 0;
-        const time = clock.toSeconds(beat);
+        const durBeats = num(v2 ? d._duration : d.duration);
+        const time = clock.toSeconds(num(beat));
         const parsed = {
             time,
-            duration: Math.max(0, clock.toSeconds(beat + durBeats) - time),
+            duration: Math.max(0, clock.toSeconds(num(beat) + durBeats) - time),
             type,
             easing: (v2 ? d._easing : d.easing) || null,
-            repeat: (v2 ? d._repeat : d.repeat) || 0,
+            repeat: num(v2 ? d._repeat : d.repeat),
             tracks: normTrack(v2 ? d._track : d.track) || [],
             target: (v2 ? d._target : d.target) || null,   // Root/Head/LeftHand/RightHand
             props: {},
@@ -186,7 +236,7 @@ function parseCustomEvents(list, clock, defs, v2) {
             }
             parsed.props = props;
         } else {
-            const anim = normAnim(d, defs);
+            const anim = normAnim(d, defs, true);
             if (anim) parsed.props = anim;
         }
         out.push(parsed);
@@ -194,8 +244,8 @@ function parseCustomEvents(list, clock, defs, v2) {
     return out;
 }
 
-// Sample a point list at time t (0..1) — thin re-export used by tests;
-// the full sampler (easings/splines) lives in noodle.js.
+// Sample a point list at time t (0..1) — thin version used by tests;
+// the full sampler (easings/splines/quaternions) lives in noodle.js.
 export function samplePoints(points, t, dims) {
     if (!points || !points.length) return null;
     if (typeof points[0] === 'number') return points.slice(0, dims);
@@ -217,7 +267,7 @@ export function samplePoints(points, t, dims) {
 // ---------- Info.dat ----------
 export function parseInfo(json) {
     const info = typeof json === 'string' ? JSON.parse(json) : json;
-    const version = info.version || info._version || '2.0.0';
+    const version = String(info.version || info._version || '2.0.0');
     const major = parseInt(version.split('.')[0], 10);
 
     if (major >= 4) {
@@ -240,6 +290,7 @@ export function parseInfo(json) {
                 (info.difficultyBeatmaps[0].beatmapAuthors.mappers || []).join(', ')) || '',
             bpm: (info.audio && info.audio.bpm) || 120,
             songFilename: (info.audio && info.audio.songFilename) || 'song.ogg',
+            audioDataFilename: (info.audio && info.audio.audioDataFilename) || null,
             coverFilename: info.coverImageFilename || null,
             environment: (info.environmentNames && info.environmentNames[0]) || 'DefaultEnvironment',
             difficulties: sortDiffs(diffs),
@@ -271,6 +322,7 @@ export function parseInfo(json) {
         levelAuthor: info._levelAuthorName || '',
         bpm: info._beatsPerMinute || 120,
         songFilename: info._songFilename || 'song.egg',
+        audioDataFilename: 'BPMInfo.dat',
         coverFilename: info._coverImageFilename || null,
         environment: info._environmentName || 'DefaultEnvironment',
         difficulties: sortDiffs(diffs),
@@ -287,11 +339,35 @@ function sortDiffs(diffs) {
     });
 }
 
+// ---------- BPM regions (v2 BPMInfo.dat / v4 AudioData.dat) ----------
+// Returns [{beat, bpm}] for maps whose tempo changes live outside the
+// difficulty file. Single-region files carry no extra information.
+export function parseBpmRegions(json) {
+    if (!json) return [];
+    let d;
+    try { d = typeof json === 'string' ? JSON.parse(json) : json; } catch (e) { return []; }
+    const freq = num(d._songFrequency ?? d.songFrequency, 44100) || 44100;
+    const regions = (d._regions || []).map(r => ({
+        si: num(r._startSampleIndex), ei: num(r._endSampleIndex),
+        sb: num(r._startBeat), eb: num(r._endBeat),
+    })).concat((d.bpmData || []).map(r => ({
+        si: num(r.si), ei: num(r.ei), sb: num(r.sb), eb: num(r.eb),
+    })));
+    if (regions.length < 2) return [];
+    const out = [];
+    for (const r of regions) {
+        const secs = (r.ei - r.si) / freq;
+        if (secs <= 0 || r.eb <= r.sb) continue;
+        out.push({ beat: r.sb, bpm: (r.eb - r.sb) / (secs / 60) });
+    }
+    return out;
+}
+
 // ---------- Beat <-> seconds with BPM changes ----------
 export class BeatClock {
     constructor(baseBpm, bpmEvents = []) {
         this.segments = [{ beat: 0, bpm: baseBpm, time: 0 }];
-        const sorted = [...bpmEvents].sort((a, b) => a.beat - b.beat);
+        const sorted = [...bpmEvents].filter(e => e.bpm > 0).sort((a, b) => a.beat - b.beat);
         for (const ev of sorted) {
             if (ev.beat <= 0) { this.segments[0].bpm = ev.bpm; continue; }
             const prev = this.segments[this.segments.length - 1];
@@ -299,71 +375,95 @@ export class BeatClock {
             this.segments.push({ beat: ev.beat, bpm: ev.bpm, time });
         }
     }
-    toSeconds(beat) {
-        let seg = this.segments[0];
-        for (let i = this.segments.length - 1; i >= 0; i--) {
-            if (this.segments[i].beat <= beat) { seg = this.segments[i]; break; }
+    _seg(beat) {
+        const s = this.segments;
+        if (s.length === 1 || beat < s[1].beat) return s[0];
+        let lo = 0, hi = s.length - 1;           // binary search: maps can have thousands
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (s[mid].beat <= beat) lo = mid; else hi = mid - 1;
         }
+        return s[lo];
+    }
+    toSeconds(beat) {
+        const seg = this._seg(beat);
         return seg.time + (beat - seg.beat) * 60 / seg.bpm;
     }
-    bpmAt(beat) {
-        let seg = this.segments[0];
-        for (let i = this.segments.length - 1; i >= 0; i--) {
-            if (this.segments[i].beat <= beat) { seg = this.segments[i]; break; }
-        }
-        return seg.bpm;
-    }
+    bpmAt(beat) { return this._seg(beat).bpm; }
 }
 
 // ---------- Difficulty file ----------
-// Returns { notes, bombs, walls, events, customEvents, clock }
-export function parseDifficulty(json, baseBpm, lightshowJson = null) {
+// Returns { notes, bombs, walls, events, customEvents, environment, clock }
+export function parseDifficulty(json, baseBpm, lightshowJson = null, bpmRegions = null) {
     const map = typeof json === 'string' ? JSON.parse(json) : json;
-    const version = map.version || map._version || '2.0.0';
+    const version = String(map.version || map._version || '2.0.0');
     const major = parseInt(version.split('.')[0], 10);
+    const regions = Array.isArray(bpmRegions) ? bpmRegions : parseBpmRegions(bpmRegions);
 
-    if (major >= 4) return parseV4(map, baseBpm, lightshowJson);
-    if (major === 3) return parseV3(map, baseBpm);
-    return parseV2(map, baseBpm);
+    let data;
+    if (major >= 4) data = parseV4(map, baseBpm, lightshowJson, regions);
+    else if (major === 3) data = parseV3(map, baseBpm, regions);
+    else data = parseV2(map, baseBpm, regions);
+    data.version = major;
+    return data;
+}
+
+// Arrow angle: v3 `a` is a counter-clockwise offset; NE v2 `_cutDirection`
+// is an absolute rotation where 0 = down.
+function angleFields(dir, offsetDeg, absoluteDeg) {
+    if (absoluteDeg != null && Number.isFinite(Number(absoluteDeg))) {
+        return { angle: Number(absoluteDeg), angleAbs: true };
+    }
+    const off = num(offsetDeg);
+    return off ? { angle: off, angleAbs: false } : { angle: 0, angleAbs: false };
 }
 
 // --- v2 ---
-function parseV2(map, baseBpm) {
+function parseV2(map, baseBpm, regions) {
     const bpmEvents = [];
     for (const ev of (map._events || [])) {
         if (ev._type === 100 && ev._floatValue > 0) bpmEvents.push({ beat: ev._time, bpm: ev._floatValue });
     }
-    const clock = new BeatClock(baseBpm, bpmEvents);
+    for (const b of (map._BPMChanges || map._bpmChanges || [])) {
+        const bpm = num(b._BPM ?? b._bpm);
+        if (bpm > 0) bpmEvents.push({ beat: num(b._time), bpm });
+    }
+    const clock = new BeatClock(baseBpm, bpmEvents.length ? bpmEvents : regions);
     const mapCd = map._customData || {};
     const defs = parsePointDefs(mapCd, true);
 
     const notes = [];
     const bombs = [];
     for (const n of (map._notes || [])) {
+        if (!n) continue;
         const cd = n._customData || {};
-        let x = n._lineIndex, y = n._lineLayer;
+        let x = num(n._lineIndex), y = num(n._lineLayer);
         if (Array.isArray(cd._position)) {          // Noodle: [lineIndex-2, lineLayer]
-            x = cd._position[0] + 2;
-            y = cd._position[1];
+            x = num(cd._position[0]) + 2;
+            y = num(cd._position[1]);
         }
-        const time = clock.toSeconds(n._time);
+        const time = clock.toSeconds(num(n._time));
         const common = {
             time, x, y,
-            njs: cd._noteJumpMovementSpeed || null,
+            lx: num(n._lineIndex), ly: num(n._lineLayer),
+            njs: num(cd._noteJumpMovementSpeed) || null,
             spawnOffset: cd._noteJumpStartBeatOffset ?? null,
             decorative: !!cd._fake || cd._interactable === false,
-            localRot: Array.isArray(cd._localRotation) ? cd._localRotation : null,
+            localRot: normVec3(cd._localRotation),
             worldRot: normWorldRot(cd._rotation),
             track: normTrack(cd._track),
             anim: normAnim(cd._animation, defs),
+            noGravity: !!cd._disableNoteGravity,
         };
         if (n._type === 3) {
             bombs.push(common);
         } else if (n._type === 0 || n._type === 1) {
+            const dir = n._cutDirection ?? 8;
             notes.push({
                 ...common,
                 color: n._type,
-                dir: n._cutDirection ?? 8,
+                dir: dir >= 0 && dir <= 8 ? dir : 8,
+                ...angleFields(dir, 0, cd._cutDirection),
                 chroma: normColor(cd._color),
             });
         }
@@ -371,26 +471,30 @@ function parseV2(map, baseBpm) {
 
     const walls = [];
     for (const o of (map._obstacles || [])) {
+        if (!o) continue;
         const cd = o._customData || {};
-        let x = o._lineIndex, y, h;
-        if (o._type === 2) { y = o._lineLayer || 0; h = o._height || 5; }
+        let x = num(o._lineIndex), y, h;
+        if (o._type === 2) { y = num(o._lineLayer); h = num(o._height, 5) || 5; }
         else if (o._type === 1) { y = 2; h = 3; }   // crouch
         else { y = 0; h = 5; }                       // full height
-        let w = o._width || 1, l = null;
-        if (Array.isArray(cd._position)) { x = cd._position[0] + 2; y = cd._position[1]; }
+        let w = num(o._width, 1), l = null;
+        if (Array.isArray(cd._position)) { x = num(cd._position[0]) + 2; y = num(cd._position[1]); }
         if (Array.isArray(cd._scale)) {
-            w = cd._scale[0] || w;
-            h = cd._scale[1] || h;
-            if (cd._scale[2] != null) l = cd._scale[2];
+            w = num(cd._scale[0], w) || w;
+            h = num(cd._scale[1], h) || h;
+            if (cd._scale[2] != null) l = num(cd._scale[2]);
         }
+        const start = num(o._time);
         walls.push({
-            time: clock.toSeconds(o._time),
-            duration: Math.max(0, clock.toSeconds(o._time + (o._duration || 0)) - clock.toSeconds(o._time)),
+            time: clock.toSeconds(start),
+            duration: Math.max(0, clock.toSeconds(start + num(o._duration)) - clock.toSeconds(start)),
             x, y, w, h, l,
             chroma: normColor(cd._color),
             decorative: !!cd._fake || cd._interactable === false,
-            localRot: Array.isArray(cd._localRotation) ? cd._localRotation : null,
+            localRot: normVec3(cd._localRotation),
             worldRot: normWorldRot(cd._rotation),
+            njs: num(cd._noteJumpMovementSpeed) || null,
+            spawnOffset: cd._noteJumpStartBeatOffset ?? null,
             track: normTrack(cd._track),
             anim: normAnim(cd._animation, defs),
         });
@@ -398,17 +502,27 @@ function parseV2(map, baseBpm) {
 
     const events = [];
     for (const ev of (map._events || [])) {
-        if (ev._type === 100 || ev._type === 14 || ev._type === 15) continue;
+        if (!ev || ev._type === 100 || ev._type === 14 || ev._type === 15) continue;
         const cd = ev._customData || {};
-        events.push({
-            time: clock.toSeconds(ev._time),
+        const value = num(ev._value);
+        const out = {
+            time: clock.toSeconds(num(ev._time)),
             type: ev._type,
-            value: ev._value,
-            float: ev._floatValue ?? 1,
+            value,
+            float: num(ev._floatValue, 1) * colorAlpha(cd._color),
             chroma: normColor(cd._color),
-            gradient: parseGradient(cd._lightGradient, clock, ev._time),
+            gradient: parseGradient(cd._lightGradient, clock, num(ev._time)),
             custom: parseEventCustom(ev._customData, true),
-        });
+            legacyColor: null,
+        };
+        // Legacy Chroma: values >= 2e9 encode an RGB color for later events
+        if (value >= 2000000000) {
+            const rgb = value - 2000000000;
+            out.legacyColor = [((rgb >> 16) & 255) / 255, ((rgb >> 8) & 255) / 255, (rgb & 255) / 255];
+        } else if (value === 1999999999) {
+            out.legacyColor = 'reset';
+        }
+        events.push(out);
     }
 
     const customEvents = parseCustomEvents(mapCd._customEvents, clock, defs, true);
@@ -417,78 +531,92 @@ function parseV2(map, baseBpm) {
 }
 
 // --- v3 ---
-function parseV3(map, baseBpm) {
-    const bpmEvents = (map.bpmEvents || []).map(e => ({ beat: e.b, bpm: e.m }));
-    const clock = new BeatClock(baseBpm, bpmEvents);
+function parseV3(map, baseBpm, regions) {
+    const bpmEvents = (map.bpmEvents || []).map(e => ({ beat: num(e.b), bpm: num(e.m) }));
+    const clock = new BeatClock(baseBpm, bpmEvents.length ? bpmEvents : regions);
     const mapCd = map.customData || {};
     const defs = parsePointDefs(mapCd, false);
 
     const v3Common = (o, forceDecorative = false) => {
         const cd = o.customData || {};
-        let x = o.x, y = o.y;
-        if (Array.isArray(cd.coordinates)) { x = cd.coordinates[0] + 2; y = cd.coordinates[1]; }
+        let x = num(o.x), y = num(o.y);
+        if (Array.isArray(cd.coordinates)) { x = num(cd.coordinates[0]) + 2; y = num(cd.coordinates[1]); }
         return {
-            time: clock.toSeconds(o.b),
+            time: clock.toSeconds(num(o.b)),
             x, y,
-            njs: cd.noteJumpMovementSpeed || null,
+            lx: num(o.x), ly: num(o.y),
+            njs: num(cd.noteJumpMovementSpeed) || null,
             spawnOffset: cd.noteJumpStartBeatOffset ?? null,
             decorative: forceDecorative || cd.uninteractable === true,
-            localRot: Array.isArray(cd.localRotation) ? cd.localRotation : null,
+            localRot: normVec3(cd.localRotation),
             worldRot: normWorldRot(cd.worldRotation),
             track: normTrack(cd.track),
             anim: normAnim(cd.animation, defs),
+            noGravity: !!cd.disableNoteGravity,
         };
     };
 
     const notes = [];
-    const pushNote = (n, forceDec = false) => notes.push({
-        ...v3Common(n, forceDec),
-        color: n.c,
-        dir: n.d ?? 8,
-        chroma: normColor((n.customData || {}).color),
-    });
+    const pushNote = (n, forceDec = false) => {
+        if (!n) return;
+        const dir = n.d ?? 8;
+        notes.push({
+            ...v3Common(n, forceDec),
+            color: n.c ?? 0,
+            dir: dir >= 0 && dir <= 8 ? dir : 8,
+            ...angleFields(dir, n.a, null),
+            chroma: normColor((n.customData || {}).color),
+        });
+    };
     for (const n of (map.colorNotes || [])) pushNote(n);
     for (const n of (mapCd.fakeColorNotes || [])) pushNote(n, true);
 
-    // Chains: links as small dot notes
-    for (const c of (map.burstSliders || [])) {
-        const base = v3Common(c);
+    // Chains: links as small dot notes. Link times are spread evenly between
+    // head and tail; squish only bends the shape (Beat Saber behaviour).
+    const pushChain = (c, forceDec = false) => {
+        if (!c) return;
+        const base = v3Common(c, forceDec);
         const headTime = base.time;
-        const tailTime = clock.toSeconds(c.tb);
-        const count = Math.max(1, (c.sc || 1) - 1);
-        const squish = c.s || 0.5;
+        const tailTime = clock.toSeconds(num(c.tb, c.b));
+        const count = Math.max(1, (c.sc || 2) - 1);
+        const squish = c.s ?? 1;
         for (let i = 1; i <= count; i++) {
-            const t = (i / count) * squish;
+            const f = i / count;
+            const sf = f * squish;
             notes.push({
                 ...base,
-                time: headTime + (tailTime - headTime) * t,
-                x: base.x + ((c.tx ?? base.x) - base.x) * t,
-                y: base.y + ((c.ty ?? base.y) - base.y) * t,
-                color: c.c,
+                time: headTime + (tailTime - headTime) * f,
+                x: base.x + ((c.tx ?? base.x) - base.x) * sf,
+                y: base.y + ((c.ty ?? base.y) - base.y) * sf,
+                color: c.c ?? 0,
                 dir: 8,
+                angle: 0, angleAbs: false,
                 chroma: normColor((c.customData || {}).color),
                 chainLink: true,
             });
         }
-    }
+    };
+    for (const c of (map.burstSliders || [])) pushChain(c);
+    for (const c of (mapCd.fakeBurstSliders || [])) pushChain(c, true);
 
     const bombs = [];
-    for (const b of (map.bombNotes || [])) bombs.push(v3Common(b));
-    for (const b of (mapCd.fakeBombNotes || [])) bombs.push(v3Common(b, true));
+    for (const b of (map.bombNotes || [])) if (b) bombs.push(v3Common(b));
+    for (const b of (mapCd.fakeBombNotes || [])) if (b) bombs.push(v3Common(b, true));
 
     const walls = [];
     const pushWall = (o, forceDec = false) => {
+        if (!o) return;
         const cd = o.customData || {};
         const base = v3Common(o, forceDec);
-        let w = o.w || 1, h = o.h || 1, l = null;
+        let w = num(o.w, 1), h = num(o.h, 1), l = null;
         if (Array.isArray(cd.size)) {
-            w = cd.size[0] || w;
-            h = cd.size[1] || h;
-            if (cd.size[2] != null) l = cd.size[2];   // explicit length in grid units
+            w = num(cd.size[0], w) || w;
+            h = num(cd.size[1], h) || h;
+            if (cd.size[2] != null) l = num(cd.size[2]);   // explicit length in grid units
         }
         walls.push({
             ...base,
-            duration: Math.max(0, clock.toSeconds(o.b + (o.d || 0)) - base.time),
+            duration: Math.max(0, clock.toSeconds(num(o.b) + num(o.d)) - base.time),
             w, h, l,
             chroma: normColor(cd.color),
         });
@@ -496,16 +624,17 @@ function parseV3(map, baseBpm) {
     for (const o of (map.obstacles || [])) pushWall(o);
     for (const o of (mapCd.fakeObstacles || [])) pushWall(o, true);
 
-    const events = (map.basicBeatmapEvents || []).map(ev => {
+    const events = (map.basicBeatmapEvents || []).filter(Boolean).map(ev => {
         const cd = ev.customData || {};
         return {
-            time: clock.toSeconds(ev.b),
+            time: clock.toSeconds(num(ev.b)),
             type: ev.et,
-            value: ev.i,
-            float: ev.f ?? 1,
+            value: num(ev.i),
+            float: num(ev.f, 1) * colorAlpha(cd.color),
             chroma: normColor(cd.color),
             gradient: null,
             custom: parseEventCustom(ev.customData, false),
+            legacyColor: null,
         };
     });
 
@@ -515,41 +644,66 @@ function parseV3(map, baseBpm) {
 }
 
 // --- v4 (split object/metadata arrays; lighting lives in the lightshow file) ---
-function parseV4(map, baseBpm, lightshowJson) {
-    const clock = new BeatClock(baseBpm, []);
+function parseV4(map, baseBpm, lightshowJson, regions) {
+    const clock = new BeatClock(baseBpm, regions);
     const nd = map.colorNotesData || [];
     const bd = map.bombNotesData || [];
     const od = map.obstaclesData || [];
+    const cdata = map.chainsData || [];
 
+    const blank = { spawnOffset: null, decorative: false, localRot: null, worldRot: null, track: null, anim: null, njs: null };
     const notes = (map.colorNotes || []).map(n => {
         const d = nd[n.i || 0] || {};
+        const dir = d.d ?? 8;
         return {
-            time: clock.toSeconds(n.b),
-            x: d.x ?? 1, y: d.y ?? 0,
+            ...blank,
+            time: clock.toSeconds(num(n.b)),
+            x: num(d.x, 1), y: num(d.y), lx: num(d.x, 1), ly: num(d.y),
             color: d.c ?? 0,
-            dir: d.d ?? 8,
-            chroma: null, njs: null,
-            spawnOffset: null, decorative: false, localRot: null, worldRot: null,
-            track: null, anim: null,
+            dir: dir >= 0 && dir <= 8 ? dir : 8,
+            ...angleFields(dir, d.a, null),
+            chroma: null,
         };
     });
+
+    for (const c of (map.chains || [])) {
+        const d = cdata[c.ci || 0];
+        const head = nd[c.i || 0];
+        if (!d || !head) continue;
+        const headTime = clock.toSeconds(num(c.hb));
+        const tailTime = clock.toSeconds(num(c.tb));
+        const count = Math.max(1, (d.c || 2) - 1);
+        const squish = d.s ?? 1;
+        for (let i = 1; i <= count; i++) {
+            const f = i / count, sf = f * squish;
+            notes.push({
+                ...blank,
+                time: headTime + (tailTime - headTime) * f,
+                x: num(head.x) + (num(d.tx, head.x) - num(head.x)) * sf,
+                y: num(head.y) + (num(d.ty, head.y) - num(head.y)) * sf,
+                lx: num(head.x), ly: num(head.y),
+                color: head.c ?? 0, dir: 8, angle: 0, angleAbs: false, chroma: null, chainLink: true,
+            });
+        }
+    }
 
     const bombs = (map.bombNotes || []).map(b => {
         const d = bd[b.i || 0] || {};
         return {
-            time: clock.toSeconds(b.b), x: d.x ?? 1, y: d.y ?? 0,
-            decorative: false, track: null, anim: null, worldRot: null,
+            ...blank,
+            time: clock.toSeconds(num(b.b)), x: num(d.x, 1), y: num(d.y), lx: num(d.x, 1), ly: num(d.y),
         };
     });
 
     const walls = (map.obstacles || []).map(o => {
         const d = od[o.i || 0] || {};
+        const start = num(o.b);
         return {
-            time: clock.toSeconds(o.b),
-            duration: Math.max(0, (d.d || 0) * 60 / baseBpm),
-            x: d.x ?? 0, y: d.y ?? 0, w: d.w || 1, h: d.h || 1,
-            chroma: null, decorative: false, localRot: null, worldRot: null,
-            track: null, anim: null,
+            ...blank,
+            time: clock.toSeconds(start),
+            duration: Math.max(0, clock.toSeconds(start + num(d.d)) - clock.toSeconds(start)),
+            x: num(d.x), y: num(d.y), w: num(d.w, 1) || 1, h: num(d.h, 1) || 1, l: null,
+            chroma: null,
         };
     });
 
@@ -561,17 +715,19 @@ function parseV4(map, baseBpm, lightshowJson) {
             events = (ls.basicEvents || []).map(ev => {
                 const d = ev.i !== undefined && evData.length ? (evData[ev.i] || {}) : ev;
                 return {
-                    time: clock.toSeconds(ev.b),
+                    time: clock.toSeconds(num(ev.b)),
                     type: d.t ?? ev.t ?? 0,
-                    value: d.i ?? ev.i ?? 0,
-                    float: d.f ?? ev.f ?? 1,
-                    chroma: null,
+                    value: num(d.i ?? ev.i),
+                    float: num(d.f ?? ev.f, 1),
+                    chroma: null, gradient: null, custom: null, legacyColor: null,
                 };
             });
         } catch (e) { /* lightshow optional */ }
     }
 
-    return finish({ notes, bombs, walls, events, customEvents: [], environment: [], clock });
+    const environment = [];
+    environment.hideGroups = [];
+    return finish({ notes, bombs, walls, events, customEvents: [], environment, clock });
 }
 
 function finish(data) {
@@ -581,6 +737,7 @@ function finish(data) {
     data.events.sort((a, b) => a.time - b.time);
     data.customEvents.sort((a, b) => a.time - b.time);
     if (!data.environment) data.environment = [];
+    if (!data.environment.hideGroups) data.environment.hideGroups = [];
     return data;
 }
 
