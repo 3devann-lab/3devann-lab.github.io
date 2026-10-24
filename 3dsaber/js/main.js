@@ -19,9 +19,10 @@ engine.onContextLost = () => {
 engine.onLightMode = () => toast('This map is very heavy for your device — switched to lighter graphics so it keeps running', 'error');
 // A level whose data keeps throwing every frame gets ended instead of hanging
 engine.onGameplayError = (err) => {
+    if (menu.editor.active) { menu.editor.previewError(err); return; }
     toast('This level hit an error and was stopped: ' + (err && err.message ? err.message : err), 'error');
     menu.abortGameplay();
-    menu.showSongs();
+    if (menu.returnTo && menu.returnTo.editor) menu.backToEditor(); else menu.showSongs();
 };
 
 // Audio context needs a user gesture; also load SFX lazily on first interaction
@@ -58,6 +59,7 @@ function loop() {
         if (gp && gp.paused && gamepad.justPressed(Buttons.START)) menu.resumeGame();
     }
     if (menu.replayControls && menu.gameplay) menu.replayControls.update(dt);
+    if (menu.editor.active) menu.editor.update(dt);
 
     engine.update();
 }

@@ -188,15 +188,20 @@ export async function downloadMap(mapMeta, onProgress = () => {}) {
 // ---------- IndexedDB ----------
 const DB_NAME = 'saber3d';
 const STORE = 'maps';
+// editor: project data (small, saved on every edit) and its audio/cover (saved once)
+export const PROJECT_STORE = 'projects';
+export const PROJECT_FILES = 'projectFiles';
 
 let dbPromise = null;        // one shared connection (opening per call was slow)
-function openDB() {
+export function openDB() {
     if (dbPromise) return dbPromise;
     dbPromise = new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, 1);
+        const req = indexedDB.open(DB_NAME, 2);
         req.onupgradeneeded = () => {
             const db = req.result;
-            if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
+            for (const name of [STORE, PROJECT_STORE, PROJECT_FILES]) {
+                if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: 'id' });
+            }
         };
         req.onsuccess = () => {
             const db = req.result;
@@ -208,6 +213,20 @@ function openDB() {
     });
     return dbPromise;
 }
+
+// generic helpers for any store
+export async function idb(storeName, mode, fn) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, mode);
+        const req = fn(tx.objectStore(storeName));
+        tx.oncomplete = () => resolve(req ? req.result : undefined);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('storage transaction aborted'));
+    });
+}
+
+export async function saveLibraryRecord(record) { return dbPut(record); }
 
 async function dbPut(record) {
     const db = await openDB();

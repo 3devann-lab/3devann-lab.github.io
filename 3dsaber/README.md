@@ -37,6 +37,33 @@ On the difficulty screen open **Modifiers & Practice**: No Fail, Instant Fail, S
 Ghost Notes, Disappearing Arrows, Small Notes, No Bombs, No Walls, song speed 0.5x–2x, and **Practice from**
 any point in the song. Practice runs and speeds below 1x don't save high scores.
 
+## Map Editor
+
+**Map Editor** on the main menu makes Beat Saber maps from any song.
+
+- **Start**: pick a song file (.ogg/.egg/.mp3/.wav). The BPM is detected for you (or tap it), a cover is made if you
+  don't have one. You can also **import a map zip** or **edit any downloaded map** (v2, v3 and v4 maps, BPM changes
+  included).
+- **Timeline** (time flows up, like ChroMapper): note lanes for the bottom / middle / top rows, walls, and nine light
+  lanes, next to the song's waveform. **Click** to place, **drag while placing** to aim a note or size a wall,
+  **right-click / right-drag** to delete, **Shift-drag** to select, drag a selection to move it.
+- **3D preview**: the map plays in the real game engine next to the timeline — scrub and it shows that exact moment.
+- **Objects**: red/blue notes (9 directions + angle offset), bombs, full/crouch walls, arcs and chains, light events
+  (blue/red/white, on/flash/fade/transition, brightness, laser speed, ring spin/zoom), Chroma colours, BPM changes,
+  bookmarks.
+- **Tools**: undo/redo, copy/cut/paste at the cursor, mirror, swap colours, snap to grid (1/1–1/64), zoom, playback
+  at 0.25x–1x with hitsounds and a metronome, strobe generator, light show from your notes, a 4×3 grid view at the
+  cursor, an inspector for exact values, stats with jump distance / reaction time, and a map checker (stacked notes,
+  notes in walls, too-short walls, impossible doubles).
+- **Difficulties**: Easy to Expert+ for Standard, One Saber, No Arrows, Lawless and Lightshow — start one empty or as a
+  copy of another, with its own NJS, offset and label.
+- **Test play** (T): jump into the game from the cursor with a controller; the pause menu and results take you back.
+- **Saving**: everything saves automatically in the browser; your maps show up in **Play** with a "Your map" badge.
+- **Export**: a zip with `Info.dat` (v2.1), v3.3 difficulty files, the song and a cover — ready for Beat Saber's
+  CustomLevels folder or ChroMapper. (Beat Saber itself needs the song as .ogg/.egg.)
+
+Press **?** in the editor for every shortcut.
+
 ## Replays
 
 **Replays** on the main menu plays back real Beat Saber runs from [BeatLeader](https://beatleader.xyz)
@@ -61,7 +88,7 @@ A control bar appears at the bottom whenever you move the mouse, pause, or hover
 - **Cameras**: **First Person** (the player's own head), **Third Person** (the camera you play with), **Follow**
   (chases the player from behind), **Free** (drag to orbit, right-drag to pan, wheel to zoom, WASD/Q/E to fly, with
   Stage / Behind / Front / Side / Top presets).
-- **⚙ Options** changes everything live while you watch:
+- **⚙ Options** changes everything live while you watch (including turning off cut halves and hit sparks):
   - **First person**: field of view, movement and rotation smoothing, level horizon (no head tilt), pull back, raise.
   - **Follow**: distance, height, smoothing.
   - **Third person**: field of view, height, distance, tilt.
@@ -128,6 +155,8 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - `js/game.js` — 3D engine, environment, lighting, gameplay, replay playback
 - `js/menu.js` — all UI screens (incl. the replay browser)
 - `js/replayui.js` — replay viewer controls (timeline, speed, cameras, live options)
+- `js/editor/` — map editor: `model.js` (project data, undo, import / export), `timeline.js` (the canvas timeline),
+  `editor.js` (screens, tools, playback, 3D preview, saving)
 - `js/ui.js` — shared UI pieces (toasts, setting rows, camera/replay option lists)
 - `js/beatmap.js` — v2/v3/v4 map parser (Chroma + Noodle)
 - `js/noodle.js` — Noodle/Heck animation + track system
