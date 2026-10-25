@@ -11,6 +11,7 @@ import { NOTE_EVENT, FRAME_STRIDE, splitNoteId, cutParts, maxCutScore } from './
 import { audio } from './audio.js';
 import { gamepad, shapeStick } from './input.js';
 import { settings } from './settings.js';
+import { buildSaber } from './looks.js';
 
 // ---------- World constants ----------
 // Notes arrive on the beat at HIT_Z. Everything Beat Saber places relative to
@@ -1086,31 +1087,11 @@ class Saber {
         this.color = new THREE.Color(colorHex);
         this.homeX = homeX;
         this.group = new THREE.Group();
-        this.geos = [];
-        this.mats = [];
-
-        const handleGeo = new THREE.CylinderGeometry(0.035, 0.042, 0.24, 12);
-        const handleMat = new THREE.MeshStandardMaterial({ color: 0x222230, roughness: 0.4, metalness: 0.9 });
-        this.group.add(new THREE.Mesh(handleGeo, handleMat));
-
-        this.bladeMat = new THREE.MeshStandardMaterial({
-            color: 0xffffff, emissive: this.color, emissiveIntensity: 2.0, roughness: 0.3,
+        // the look you picked in Customize (hits use the same blade whatever the style)
+        this.model = buildSaber(colorHex, {
+            style: settings.get('saberStyle'), hilt: settings.get('saberHilt'), glow: settings.get('saberGlow'),
         });
-        const bladeGeo = new THREE.CylinderGeometry(0.028, 0.02, BLADE_LEN, 10);
-        this.blade = new THREE.Mesh(bladeGeo, this.bladeMat);
-        this.blade.position.y = 0.14 + BLADE_LEN / 2;
-        this.group.add(this.blade);
-
-        const glowMat = new THREE.MeshBasicMaterial({
-            color: this.color, transparent: true, opacity: 0.14,
-            blending: THREE.AdditiveBlending, depthWrite: false,
-        });
-        const glowGeo = new THREE.CylinderGeometry(0.075, 0.055, BLADE_LEN * 1.02, 10);
-        const glow = new THREE.Mesh(glowGeo, glowMat);
-        glow.position.copy(this.blade.position);
-        this.group.add(glow);
-        this.geos.push(handleGeo, bladeGeo, glowGeo);
-        this.mats.push(handleMat, this.bladeMat, glowMat);
+        this.group.add(this.model.group);
 
         // Tilt blade slightly forward so it points up + away
         this.group.rotation.x = -0.5;
@@ -1290,8 +1271,7 @@ class Saber {
         this.trailMesh.removeFromParent();
         this.trailMesh.geometry.dispose();
         this.trailMat.dispose();
-        for (const g of this.geos) g.dispose();
-        for (const m of this.mats) m.dispose();
+        this.model.dispose();
     }
 }
 

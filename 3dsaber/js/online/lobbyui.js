@@ -9,7 +9,9 @@ import { authMessage } from './firebase.js';
 import { Match } from './match.js';
 import { getSavedMaps, searchMaps, downloadMap, getMapByHash } from '../beatsaver.js';
 import { BUILTIN_SONG } from '../builtin.js';
-import { cursor } from '../input.js';
+import { cursor, gamepad } from '../input.js';
+import { drawPortrait } from '../looks.js';
+import { showCustomize } from '../customize.js';
 import { toast, esc } from '../ui.js';
 
 const $ = (id) => document.getElementById(id);
@@ -75,7 +77,6 @@ export class LobbyUI {
     // ---------- lobby browser + who's online ----------
     showBrowser() {
         const menu = this.menu;
-        this.screen = 'browser';
         menu.setScreen(`
         <div class="screen panel-screen">
             <div class="panel mp-panel">
@@ -94,6 +95,7 @@ export class LobbyUI {
                 </div>
             </div>
         </div>`);
+        this.screen = 'browser';
         menu.enterMenuMode(() => menu.showHome());
         $('btn-back').onclick = () => menu.showHome();
         $('mp-create').onclick = () => this.createDialog();
@@ -189,7 +191,6 @@ export class LobbyUI {
     showLobby() {
         const menu = this.menu;
         if (!mp.lobbyId) { this.showBrowser(); return; }
-        this.screen = 'lobby';
         menu.setScreen(`
         <div class="screen panel-screen">
             <div class="panel mp-panel mp-lobby">
@@ -197,6 +198,7 @@ export class LobbyUI {
                     <div class="panel-title" id="lb-name"></div>
                     <div class="mp-code-chip" title="Friends join with this code">CODE <b id="lb-code"></b></div>
                     <span class="ed-grow"></span>
+                    <button class="btn small" id="lb-custom" title="Your avatar and sabers — everyone here sees them">Customize</button>
                     <button class="btn small danger" id="lb-leave">Leave Lobby</button>
                 </div>
                 <div class="panel-body mp-lobby-body">
@@ -210,8 +212,11 @@ export class LobbyUI {
                 </div>
             </div>
         </div>`);
+        this.screen = 'lobby';          // after setScreen: it runs the old screen's cleanup, which may be this one's
         menu.enterMenuMode(() => this.leave());
         $('lb-leave').onclick = () => this.leave();
+        $('lb-custom').onclick = () => showCustomize(menu, { back: () => this.showLobby() });
+        mp.setPad();
         $('lb-chat-form').onsubmit = (e) => {
             e.preventDefault();
             const inp = $('lb-chat-in');
@@ -245,6 +250,8 @@ export class LobbyUI {
         if (what === 'online') { if (mp.lobbyId) toast('Reconnected', 'success'); return; }
         if (what === 'sel') this.ensureLevel();
         if (what === 'game') { this.onGame(); return; }
+        // (anyone whose song is already over keeps their results)
+        if (this.match && !this.match.finished && (what === 'gameUpdate' || what === 'members' || what === 'info') && this.matchAborted()) { this.abortToLobby(); return; }
         if (what === 'removed' || what === 'lost') {
             toast(what === 'lost' ? 'Lost the connection to the lobby' : 'You were removed from the lobby', 'error');
             if (this.screen === 'lobby') this.showBrowser();
@@ -267,13 +274,15 @@ export class LobbyUI {
         const levelState = (m) => !L.sel ? '' : m.has === 'yes' ? '<span class="mp-has yes" title="Has the level">✓ level</span>'
             : m.has === 'downloading' ? `<span class="mp-has dl">⬇ ${Math.round((m.progress || 0) * 100)}%</span>`
             : m.has === 'missing' ? '<span class="mp-has no">✗ can\'t get level</span>' : '<span class="mp-has">…</span>';
+        const pad = (m) => (m.pad === true ? '<span class="mp-pad" title="Controller connected">🎮</span>' : '<span class="mp-has no">no controller</span>');
         box.innerHTML = list.map(([uid, m]) => `
             <div class="mp-player ${uid === mp.uid ? 'me' : ''}">
-                <span class="account-dot ${info.host === uid ? 'host' : ''}">${info.host === uid ? '♛' : esc(String(m.name || '?')[0].toUpperCase())}</span>
+                <span class="mp-portrait"><canvas width="72" height="72" data-portrait="${esc(uid)}"></canvas>${info.host === uid ? '<i class="mp-crown" title="Host">♛</i>' : ''}</span>
                 <div class="mp-player-info"><b>${esc(m.name || 'Player')}${uid === mp.uid ? ' <small>(you)</small>' : ''}</b>
-                    <small>${info.host === uid ? 'Host' : m.ready ? '<span class="mp-ready">Ready</span>' : 'Not ready'} ${levelState(m)}</small></div>
+                    <small>${info.host === uid ? 'Host' : m.ready ? '<span class="mp-ready">Ready</span>' : 'Not ready'} ${pad(m)} ${levelState(m)}</small></div>
                 ${mp.isHost && uid !== mp.uid ? `<div class="mp-player-btns"><button class="sort-btn" data-host="${uid}" title="Make host">♛</button><button class="sort-btn" data-kick="${uid}" title="Remove from lobby">✕</button></div>` : ''}
             </div>`).join('');
+        box.querySelectorAll('[data-portrait]').forEach(c => { const m = L.members[c.dataset.portrait]; drawPortrait(c, m && m.look && m.look.avatar); });
         box.querySelectorAll('[data-host]').forEach(b => { b.onclick = () => mp.makeHost(b.dataset.host).catch(e => toast(authMessage(e), 'error')); });
         box.querySelectorAll('[data-kick]').forEach(b => {
             b.onclick = () => {
@@ -326,6 +335,7 @@ export class LobbyUI {
             const chars = [...new Set(diffs.map(d => d.characteristic))];
             const mods = (sel && sel.mods) || L.pendingMods || defaultMods();
             const iHave = sel && (L.members[mp.uid] || {}).has === 'yes';
+            const noPad = mp.noController().map(p => (p.uid === mp.uid ? 'you' : p.name));
             box.innerHTML = `
                 <div class="mp-controls">
                     <button class="btn small" id="lc-pick">${sel ? 'Change Level' : 'Choose Level'}</button>
@@ -336,8 +346,9 @@ export class LobbyUI {
                 <div class="mp-mods-title">Modifiers <small>everyone plays with these</small></div>
                 ${this.modsHtml(mods)}
                 <div class="mp-start">
-                    <button class="btn primary" id="lc-start" ${!sel || !iHave || playing ? 'disabled' : ''}>${playing ? 'Match in progress' : 'Start Match'}</button>
-                    <div class="mp-start-note">${!sel ? 'Choose a level first.' : !iHave ? 'Getting the level…'
+                    <button class="btn primary" id="lc-start" ${!sel || !iHave || playing || noPad.length ? 'disabled' : ''}>${playing ? 'Match in progress' : 'Start Match'}</button>
+                    <div class="mp-start-note ${noPad.length ? 'warn' : ''}">${noPad.length ? `🎮 Waiting for a controller: <b>${esc(noPad.join(', '))}</b>. They can connect one or leave${noPad.length === 1 && noPad[0] === 'you' ? '' : ', or you can remove them (✕)'}.`
+                        : !sel ? 'Choose a level first.' : !iHave ? 'Getting the level…'
                         : waiting.length ? `Still getting the level: ${esc(waiting.join(', '))} (they'll sit this one out if you start now)`
                         : notReady.length ? `Not ready yet: ${esc(notReady.join(', '))}` : members.length > 1 ? 'Everyone is ready ✓' : 'You\'re the only one here — share the code!'}</div>
                 </div>`;
@@ -354,7 +365,8 @@ export class LobbyUI {
                     <button class="btn small" id="lc-sug-level">Suggest a Level</button>
                     <button class="btn small" id="lc-sug-mods">Suggest Modifiers</button>
                 </div>
-                <div class="mp-start-note">${playing ? 'A match is being played — you\'ll be in the next one.' : 'The host picks the level and starts the match. Suggestions show up for the host to use.'}</div>`;
+                <div class="mp-start-note ${gamepad.connected ? '' : 'warn'}">${!gamepad.connected ? '🎮 Connect a controller — the host can\'t start the match until you do.'
+                    : playing ? 'A match is being played — you\'ll be in the next one.' : 'The host picks the level and starts the match. Suggestions show up for the host to use.'}</div>`;
             $('lc-ready').onclick = () => mp.setReady(!me.ready).then(() => this.renderControls()).catch(e => toast(authMessage(e), 'error'));
             $('lc-sug-level').onclick = () => this.openPicker('suggest');
             $('lc-sug-mods').onclick = () => this.suggestModsDialog();
@@ -617,7 +629,7 @@ export class LobbyUI {
         el.className = 'modal-backdrop mp-match-menu';
         el.innerHTML = `<div class="modal" style="width:min(380px,90vw);text-align:center">
             <div class="result-title">MULTIPLAYER</div>
-            <div class="sub">The song keeps going — everyone is playing together.</div>
+            <div class="sub">${mp.isHost ? 'The song keeps going. You\'re the host: if you leave, the match ends and everyone goes back to the lobby.' : 'The song keeps going — everyone is playing together.'}</div>
             <div class="menu-buttons" style="width:100%"><button class="btn primary" id="mm-keep">Keep Playing</button>
             <button class="btn danger" id="mm-leave">Leave Match</button></div></div>`;
         document.body.appendChild(el);
@@ -625,11 +637,38 @@ export class LobbyUI {
         el.querySelector('#mm-keep').onclick = () => this.closeMatchMenu();
         el.querySelector('#mm-leave').onclick = () => {
             el.remove();
+            const wasHost = mp.isHost && !!this.match;
             if (this.match) this.match.leave();
             menu.abortGameplay();
             this.endMatch();
+            // the host leaving ends the match for everyone (after we're out of it ourselves)
+            if (wasHost) mp.abortMatch().catch(() => {});
             this.showLobby();
         };
+    }
+
+    // the host left mid-match (or called it off): everyone goes back to the lobby
+    matchAborted() {
+        const m = this.match, L = mp.lobby;
+        if (!m || !L || !mp.lobbyId) return false;
+        if (L.game && L.game.round === m.round && L.game.aborted) return true;
+        const host = m.game.host;
+        if (!host) return false;
+        // someone else runs the lobby now (the match's host left, or dropped off and was replaced)
+        if (L.info && L.info.host && L.info.host !== host) return true;
+        return host !== mp.uid && !!L.members && !L.members[host];
+    }
+
+    abortToLobby() {
+        const menu = this.menu;
+        document.querySelectorAll('.mp-match-menu').forEach(m => m.remove());
+        if (this.match) this.match.stop();
+        if (menu.gameplay) menu.abortGameplay();
+        const wasHost = this.match && this.match.game.host === mp.uid;
+        this.endMatch();
+        if (mp.isHost) mp.endMatch().catch(() => {});
+        toast(wasHost ? 'You lost the connection, so the match ended — everyone is back in the lobby' : 'The host left the match — everyone is back in the lobby', 'error');
+        if (mp.lobbyId) this.showLobby(); else this.showBrowser();
     }
 
     closeMatchMenu() {
@@ -650,7 +689,6 @@ export class LobbyUI {
     showResults(match, results, isNewBest) {
         const menu = this.menu;
         this.closeMatchMenu();
-        this.screen = 'results';
         menu.setScreen(`
         <div class="screen panel-screen">
             <div class="panel mp-panel mp-results">
@@ -672,6 +710,7 @@ export class LobbyUI {
                 </div>
             </div>
         </div>`);
+        this.screen = 'results';
         menu.enterMenuMode(() => this.backToLobby());
         $('mp-back').onclick = () => this.backToLobby();
         const render = (rows) => {

@@ -11,6 +11,9 @@
 //   lobbyPoses/{code}/{uid}   saber positions, so you can see the others play
 import { account } from './account.js';
 import { findSavedByHash, getSavedMap, getMapByHash, downloadMap } from '../beatsaver.js';
+import { gamepad } from '../input.js';
+import { settings } from '../settings.js';
+import { myLook } from '../looks.js';
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 export const MAX_PLAYERS = 10;
@@ -237,6 +240,8 @@ export class Multiplayer {
         const data = {
             name: this.name, joined: this._joined, ready: !!(cur && cur.ready),
             has: (cur && cur.has) || 'none', progress: (cur && cur.progress) || 0,
+            pad: gamepad.connected,            // nobody starts a match without a controller
+            look: myLook(settings),            // your avatar + sabers, for the others
         };
         for (let attempt = 0; ; attempt++) {
             try { await D.set(me, data); break; } catch (err) {
@@ -304,6 +309,7 @@ export class Multiplayer {
             if (fresh && firstGame && L.game.startAt < this.serverNow() - 2000) { firstGame = false; return; }
             firstGame = false;
             if (fresh) this.emit('game');
+            else if (L.game) this.emit('gameUpdate');
         });
         this.subs.push(D.onValue(D.query(this.ref(`lobbyChat/${id}`), D.limitToLast(60)), (s) => {
             const v = s.val() || {};
@@ -395,6 +401,13 @@ export class Multiplayer {
     }
 
     setReady(ready) { return this.updateMe({ ready: !!ready }); }
+    setPad() { return this.lobbyId ? this.updateMe({ pad: gamepad.connected }).catch(() => {}) : Promise.resolve(); }
+    refreshLook() { return this.lobbyId ? this.updateMe({ look: myLook(settings) }).catch(() => {}) : Promise.resolve(); }
+
+    // players who can't play yet because no controller is connected
+    noController() {
+        return Object.entries((this.lobby && this.lobby.members) || {}).filter(([, m]) => m.pad !== true).map(([uid, m]) => ({ uid, name: m.name || 'Player' }));
+    }
     setHas(has, progress = 0) { return this.updateMe({ has, progress: Math.round(progress * 100) / 100 }); }
 
     // host: what to play
@@ -459,14 +472,23 @@ export class Multiplayer {
     async startMatch(leadMs = 5000) {
         const L = this.lobby, D = this.fb.D;
         if (!L.sel) throw new Error('Pick a level first');
+        const missing = this.noController();
+        if (missing.length) throw new Error(`Waiting for a controller: ${missing.map(m => m.name).join(', ')}`);
         const round = ((L.game && L.game.round) || 0) + 1;
         await D.remove(this.ref('lobbyLive/' + this.lobbyId)).catch(() => {});
         await D.set(this.ref('lobbyGame/' + this.lobbyId), {
             round, startAt: this.serverNow() + leadMs,
             level: L.sel.level, characteristic: L.sel.characteristic, difficulty: L.sel.difficulty, mods: L.sel.mods || defaultMods(),
-            players: Object.keys(L.members || {}),
+            players: Object.keys(L.members || {}), host: this.uid,
         });
         await D.update(this.ref('lobbyInfo/' + this.lobbyId), { status: 'playing' });
+    }
+
+    // host left the match: everyone goes back to the lobby
+    async abortMatch() {
+        if (!this.isHost || !this.lobbyId || !this.lobby.game) return;
+        await this.fb.D.update(this.ref('lobbyGame/' + this.lobbyId), { aborted: true }).catch(() => {});
+        await this.endMatch().catch(() => {});
     }
 
     // host: back to picking levels

@@ -61,6 +61,7 @@ function loop() {
     if (menu.replayControls && menu.gameplay) menu.replayControls.update(dt);
     if (menu.editor.active) menu.editor.update(dt);
     if (menu.match) menu.match.update(dt);
+    if (menu.showcase) menu.showcase.update(dt);
 
     engine.update();
 }

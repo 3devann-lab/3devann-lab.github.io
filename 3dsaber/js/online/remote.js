@@ -1,8 +1,9 @@
-// ============ Other players in a match: their sabers, head and name, beside you ============
+// ============ Other players in a match: their avatar, sabers and name, beside you ============
+// (you never see your own avatar — you play from behind your sabers)
 import * as THREE from 'three';
 import { HIT_Z } from '../game.js';
+import { buildSaber, buildAvatar, cleanSaber } from '../looks.js';
 
-const BLADE = 1.05;
 // seats left and right of your own spot, closest first
 const SEATS = [-2.9, 2.9, -5.4, 5.4, -7.9, 7.9, -10.4, 10.4, -12.9];
 const DELAY = 0.15;              // seconds behind live, so there's always a pose to blend toward
@@ -25,43 +26,39 @@ function nameTexture(text, score = '') {
 }
 
 class Avatar {
-    constructor(parent, name, seatX, colors) {
+    // player: {name, look: {avatar, saber}} — their own avatar and sabers, in their colours
+    constructor(parent, player, seatX) {
+        const look = player.look || {};
+        const saber = cleanSaber(look.saber);
         this.group = new THREE.Group();
         this.group.position.set(seatX, 0, HIT_Z);
         this.group.rotation.y = -Math.atan2(seatX, 9) * 0.6;       // turned a little toward the track
         parent.add(this.group);
         this.disposables = [];
-        this.sabers = colors.map((col) => {
-            const s = new THREE.Group();
-            const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.036, 0.22, 8), new THREE.MeshBasicMaterial({ color: 0x2a2a3a }));
-            const blade = new THREE.Mesh(new THREE.CylinderGeometry(0.024, 0.018, BLADE, 8),
-                new THREE.MeshBasicMaterial({ color: new THREE.Color(col).multiplyScalar(1.6) }));
-            blade.position.y = 0.13 + BLADE / 2;
-            const glow = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.045, BLADE, 8),
-                new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.18, blending: THREE.AdditiveBlending, depthWrite: false }));
-            glow.position.y = blade.position.y;
-            s.add(handle, blade, glow);
-            s.visible = false;
-            this.group.add(s);
-            for (const m of [handle, blade, glow]) this.disposables.push(m.geometry, m.material);
-            return s;
+        this.models = [saber.left, saber.right].map((col) => {
+            const m = buildSaber(col, saber);
+            m.group.visible = false;
+            this.group.add(m.group);
+            return m;
         });
-        const head = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 12), new THREE.MeshBasicMaterial({ color: 0xcfd6ff, transparent: true, opacity: 0.85 }));
-        head.position.set(0, 1.72, 0.55);
-        const visor = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.06, 0.05), new THREE.MeshBasicMaterial({ color: 0x7c5cff }));
-        visor.position.set(0, 1.74, 0.43);
-        const pad = new THREE.Mesh(new THREE.RingGeometry(0.42, 0.5, 40).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x7c5cff, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false }));
-        pad.position.set(0, 0.02, 0.45);
-        this.group.add(head, visor, pad);
-        for (const m of [head, visor, pad]) this.disposables.push(m.geometry, m.material);
-        this.labelMat = new THREE.SpriteMaterial({ map: nameTexture(name), transparent: true, depthWrite: false });
+        this.sabers = this.models.map(m => m.group);
+        // the character stands just behind its sabers
+        this.avatar = buildAvatar(look.avatar);
+        this.avatar.root.position.set(0, 0, 0.62);
+        this.group.add(this.avatar.root);
+        const pad = new THREE.Mesh(new THREE.RingGeometry(0.42, 0.5, 40).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: saber.right, transparent: true, opacity: 0.4, side: THREE.DoubleSide, depthWrite: false }));
+        pad.position.set(0, 0.02, 0.5);
+        this.group.add(pad);
+        this.disposables.push(pad.geometry, pad.material);
+        this.name = player.name || 'Player';
+        this.labelMat = new THREE.SpriteMaterial({ map: nameTexture(this.name), transparent: true, depthWrite: false });
         this.label = new THREE.Sprite(this.labelMat);
         this.label.scale.set(1.3, 0.325, 1);
-        this.label.position.set(0, 2.25, 0.55);
+        this.label.position.set(0, 2.32, 0.62);
         this.group.add(this.label);
-        this.name = name;
         this.scoreText = '';
         this.frames = [];        // [{t, l, r}] newest last
+        this.t = Math.random() * 10;
     }
 
     setScore(text) {
@@ -81,15 +78,23 @@ class Avatar {
         if (this.frames.length > 12) this.frames.shift();
     }
 
-    update(now) {
+    update(now, dt = 0.016) {
+        // the character bobs a little and leans toward where its sabers are
+        this.t += dt;
+        const a = this.avatar;
+        const lean = this.sabers[0].visible ? (this.sabers[0].position.x + this.sabers[1].position.x) * 0.25 : 0;
+        a.head.position.x += (lean - a.head.position.x) * Math.min(1, dt * 4);
+        a.head.position.y = 1.68 + Math.sin(this.t * 3.1) * 0.015;
+        a.head.rotation.z = -a.head.position.x * 0.6;
+        a.body.position.x = a.head.position.x * 0.45;
         const f = this.frames;
         if (!f.length) return;
         const t = now - DELAY * 1000;
-        let a = f[0], b = f[0];
-        for (let i = 0; i < f.length - 1; i++) { if (f[i + 1].t >= t) { a = f[i]; b = f[i + 1]; break; } a = b = f[i + 1]; }
-        const k = b.t > a.t ? Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t))) : 1;
-        this.apply(this.sabers[0], a.l, b.l, k);
-        this.apply(this.sabers[1], a.r, b.r, k);
+        let fa = f[0], fb = f[0];
+        for (let i = 0; i < f.length - 1; i++) { if (f[i + 1].t >= t) { fa = f[i]; fb = f[i + 1]; break; } fa = fb = f[i + 1]; }
+        const k = fb.t > fa.t ? Math.min(1, Math.max(0, (t - fa.t) / (fb.t - fa.t))) : 1;
+        this.apply(this.sabers[0], fa.l, fb.l, k);
+        this.apply(this.sabers[1], fa.r, fb.r, k);
     }
 
     apply(s, A, B, k) {
@@ -103,6 +108,8 @@ class Avatar {
     dispose() {
         this.group.removeFromParent();
         for (const d of this.disposables) d.dispose();
+        for (const m of this.models) m.dispose();
+        this.avatar.dispose();
         this.labelMat.map.dispose();
         this.labelMat.dispose();
     }
@@ -111,20 +118,20 @@ class Avatar {
 const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion();
 
 export class RemotePlayers {
-    constructor(scene, colors) {
+    constructor(scene) {
         this.root = new THREE.Group();
         this.root.name = 'remote-players';
         scene.add(this.root);
-        this.colors = colors;
         this.avatars = new Map();     // uid -> Avatar
+        this._last = performance.now();
     }
 
-    // players: [{uid, name}] (not you); seats follow the order given
+    // players: [{uid, name, look}] (not you); seats follow the order given
     setPlayers(players) {
         const keep = new Set(players.map(p => p.uid));
         for (const [uid, av] of this.avatars) if (!keep.has(uid)) { av.dispose(); this.avatars.delete(uid); }
         players.forEach((p, i) => {
-            if (!this.avatars.has(p.uid) && i < SEATS.length) this.avatars.set(p.uid, new Avatar(this.root, p.name || 'Player', SEATS[i], this.colors));
+            if (!this.avatars.has(p.uid) && i < SEATS.length) this.avatars.set(p.uid, new Avatar(this.root, p, SEATS[i]));
         });
     }
 
@@ -139,7 +146,11 @@ export class RemotePlayers {
         for (const [uid, text] of Object.entries(scores)) { const av = this.avatars.get(uid); if (av) av.setScore(text); }
     }
 
-    update(now) { for (const av of this.avatars.values()) av.update(now); }
+    update(now) {
+        const t = performance.now(), dt = Math.min(0.1, (t - this._last) / 1000);
+        this._last = t;
+        for (const av of this.avatars.values()) av.update(now, dt);
+    }
 
     dispose() {
         for (const av of this.avatars.values()) av.dispose();
