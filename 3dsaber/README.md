@@ -217,6 +217,11 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - Songs that can't be decoded into memory (long songs on low-memory devices) are decoded at a lower sample
   rate, or streamed, instead of failing with "Unable to decode audio data". Long songs, or any song on a
   device with 4 GB of memory or less, decode at 32 kHz from the start (a third less memory)
+- **Memory Saver** (Settings → Graphics; Auto turns it on for Xbox and other console browsers and low-memory
+  devices): songs stream instead of being decoded into memory (Paradigm's song: 0 MB instead of 113 MB), and
+  the render buffers stay at one pixel per screen pixel with no MSAA. Big maps like Paradigm load on the Xbox
+  browser. A song that once failed to decode for lack of memory turns it on for good
+- While a level plays, only its own difficulty file is kept (for Retry); the song file is let go once it's playing
 - The library keeps each map's summary apart from its song and difficulty files: lists and searches never load
   every downloaded song into memory at once (that could crash the tab with a big library). Older libraries
   are converted automatically
@@ -251,4 +256,5 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - `js/input.js` — gamepad + virtual cursor
 - `js/audio.js` — song clock + SFX
 - `js/settings.js` — persistent settings + high scores
+- `js/device.js` — what the device can afford (Memory Saver: consoles, low-memory devices)
 - `proxy/` — optional Cloudflare Worker for BeatLeader API access

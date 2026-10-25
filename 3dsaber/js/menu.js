@@ -25,6 +25,7 @@ import { showAuth, accountSection } from './online/authui.js';
 import { mp } from './online/multiplayer.js';
 import { LobbyUI } from './online/lobbyui.js';
 import { showCustomize } from './customize.js';
+import { lowMemory, isConsole } from './device.js';
 import {
     toast, esc, fmt, settingBuilders, PLAY_CAMERA_ROWS, FIRST_PERSON_ROWS, FOLLOW_ROWS, REPLAY_VIEW_ROWS,
     CONTROL_ROWS, MOD_ROWS, SOUND_ROWS, LOOK_ROWS, HUD_ROWS,
@@ -55,6 +56,14 @@ const MODE_ALIASES = {
     Standard: ['Standard'], OneSaber: ['OneSaber'], NoArrows: ['NoArrows'],
     '90Degree': ['90Degree'], '360Degree': ['360Degree'], Lawless: ['Lawless'], Lightshow: ['Lightshow'],
 };
+
+// a level's record kept while playing: just what a retry needs
+function slimRecord(rec, diff) {
+    const files = rec.diffFiles || {};
+    const keep = {};
+    for (const name of [diff.filename, diff.lightshowFilename, '__bpm']) if (name && files[name] != null) keep[name] = files[name];
+    return { ...rec, songBuf: null, diffFiles: keep };
+}
 
 export class Menu {
     constructor(engine) {
@@ -431,9 +440,10 @@ export class Menu {
         // a decoded song can be 50–250 MB: let the previous one go before decoding the next
         this.dropAudioCache();
         if (!record.songBuf || !record.songBuf.byteLength) throw new Error('the song file is missing — delete the map and download it again');
-        const buffer = await audio.decode(record.songBuf);
+        // consoles (Xbox) and low-memory devices stream songs instead of holding
+        // them decoded in memory (only small ones are worth decoding there)
+        const buffer = await audio.decode(record.songBuf, { preferStream: lowMemory() && record.songBuf.byteLength > 2.5e6 });
         this.audioCache = { id: record.id, buffer };
-        if (buffer.isMedia) toast('Song is streamed (not enough memory to decode it) — timing may be slightly less exact');
         return buffer;
     }
 
@@ -467,8 +477,10 @@ export class Menu {
                 bpm = BUILTIN_SONG.bpm;
                 mapId = BUILTIN_SONG.id;
             } else {
-                // lists only hold map summaries: fetch this map's song and difficulty files
-                record = await loadFullMap(record);
+                // lists only hold map summaries: fetch this map's song and difficulty
+                // files (a retry already has its song and difficulty at hand)
+                const songReady = this.audioCache && this.audioCache.id === record.id;
+                if (!songReady || !(record.diffFiles && record.diffFiles[diff.filename])) record = await loadFullMap(record);
                 songBuffer = await this.decodeSong(record);
                 const raw = record.diffFiles[diff.filename];
                 if (!raw) throw new Error('Difficulty file missing from download');
@@ -497,7 +509,9 @@ export class Menu {
             // the match was called off while the song loaded (the lobby is already back on screen)
             if (mpOpts && this.match !== mpOpts.match) return;
 
-            this.currentLevel = { builtinSong, record, diff, replayCtx };
+            // remembered for Retry — without the song file (the decoded/streamed
+            // song is cached) or the other difficulties' files, which only cost memory
+            this.currentLevel = { builtinSong, record: record && slimRecord(record, diff), diff, replayCtx };
             this.setScreen('');
             cursor.disable();
             $('hint-bar').classList.add('hidden');
@@ -734,6 +748,7 @@ export class Menu {
         else if (key === 'bloomStrength') this.engine.setBloomStrength(v);
         else if (key === 'bloom') this.engine.setBloom(v);
         else if (key === 'quality') this.engine.setQuality(v);
+        else if (key === 'memorySaver') { this.engine.lowMem = lowMemory(); this.engine.setQuality(this.engine.qualityName); if (!this.gameplay) this.dropAudioCache(); }
     }
 
     resumeGame() {
@@ -1486,6 +1501,8 @@ export class Menu {
         b.toggle('wallDistortion', 'Wall Distortion', 'Energy-field effect on walls near you (wall art always uses the light look)');
         b.slider('bloomStrength', 'Glow Intensity', 'How strong the bloom glow is', 0, 1.2, 0.05, (v) => v.toFixed(2));
         b.toggle('safeMode', 'Overload Protection', 'If a map overloads your GPU, switch to lighter graphics instead of freezing');
+        b.choice('memorySaver', 'Memory Saver', `Streams songs instead of loading them into memory and keeps graphics buffers small, so big maps fit on consoles. Auto is on for ${isConsole ? 'this console' : 'Xbox and low-memory devices'}`,
+            [['auto', 'Auto'], ['on', 'On'], ['off', 'Off']]);
 
         b.section('Online');
         const proxyRow = b.text('blProxy', 'BeatLeader Proxy',
