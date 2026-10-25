@@ -1,0 +1,118 @@
+{
+  "rules": {
+    "profiles": {
+      ".read": "auth != null",
+      "$uid": {
+        ".write": "auth != null && auth.uid === $uid",
+        ".validate": "newData.child('name').isString() && newData.child('name').val().length >= 1 && newData.child('name').val().length <= 24"
+      }
+    },
+    "users": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid"
+      }
+    },
+    "presence": {
+      ".read": "auth != null",
+      "$uid": {
+        ".write": "auth != null && auth.uid === $uid",
+        ".validate": "newData.child('name').isString() && newData.child('name').val().length <= 24"
+      }
+    },
+    "lobbyInfo": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && ((!data.exists() && newData.child('host').val() === auth.uid && (!root.child('lobbyMembers').child($lobby).exists() || root.child('lobbyMembers').child($lobby).child(auth.uid).exists())) || data.child('host').val() === auth.uid || (data.exists() && newData.child('host').val() === auth.uid && root.child('lobbyMembers').child($lobby).child(auth.uid).exists() && !root.child('lobbyMembers').child($lobby).child(data.child('host').val()).exists()))",
+        ".validate": "newData.child('host').isString() && newData.child('name').isString() && newData.child('name').val().length >= 1 && newData.child('name').val().length <= 40"
+      }
+    },
+    "lobbyMembers": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && !newData.exists() && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid",
+        "$uid": {
+          ".write": "auth != null && ((auth.uid === $uid && (!newData.exists() || root.child('lobbyInfo').child($lobby).exists() || data.exists())) || (!newData.exists() && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid))",
+          ".validate": "newData.child('name').isString() && newData.child('name').val().length >= 1 && newData.child('name').val().length <= 24"
+        }
+      }
+    },
+    "lobbySel": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid"
+      }
+    },
+    "lobbyGame": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid"
+      }
+    },
+    "lobbySuggest": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && !newData.exists() && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid",
+        "$sid": {
+          ".write": "auth != null && ((!data.exists() && newData.child('by').val() === auth.uid && root.child('lobbyMembers').child($lobby).child(auth.uid).exists()) || (!newData.exists() && (data.child('by').val() === auth.uid || root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid)))",
+          ".validate": "newData.child('name').isString() && newData.child('name').val().length <= 24 && newData.child('kind').isString() && newData.child('kind').val().length <= 8",
+          "characteristic": {
+            ".validate": "newData.isString() && newData.val().length <= 32"
+          },
+          "difficulty": {
+            ".validate": "newData.isString() && newData.val().length <= 16"
+          },
+          "at": {
+            ".validate": "newData.isNumber()"
+          },
+          "by": {
+            ".validate": "newData.isString()"
+          },
+          "name": {
+            ".validate": "newData.isString()"
+          },
+          "kind": {
+            ".validate": "newData.isString()"
+          },
+          "level": {
+            ".validate": "newData.hasChildren(['source', 'songName']) && newData.child('songName').isString() && newData.child('songName').val().length <= 200"
+          },
+          "mods": {
+            ".validate": "newData.hasChildren()"
+          },
+          "$other": {
+            ".validate": "false"
+          }
+        }
+      }
+    },
+    "lobbyChat": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && !newData.exists() && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid",
+        "$cid": {
+          ".write": "auth != null && !data.exists() && newData.child('by').val() === auth.uid && root.child('lobbyMembers').child($lobby).child(auth.uid).exists()",
+          ".validate": "newData.child('text').isString() && newData.child('text').val().length >= 1 && newData.child('text').val().length <= 200"
+        }
+      }
+    },
+    "lobbyLive": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && !newData.exists() && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid",
+        "$uid": {
+          ".write": "auth != null && auth.uid === $uid && (!newData.exists() || root.child('lobbyMembers').child($lobby).child(auth.uid).exists())"
+        }
+      }
+    },
+    "lobbyPoses": {
+      ".read": "auth != null",
+      "$lobby": {
+        ".write": "auth != null && !newData.exists() && root.child('lobbyInfo').child($lobby).child('host').val() === auth.uid",
+        "$uid": {
+          ".write": "auth != null && auth.uid === $uid && (!newData.exists() || root.child('lobbyMembers').child($lobby).child(auth.uid).exists())"
+        }
+      }
+    }
+  }
+}

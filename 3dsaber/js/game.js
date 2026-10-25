@@ -1523,7 +1523,9 @@ export class Gameplay {
         this.failed = false;
         this.finished = false;
         this.paused = false;
-        this.noFail = this.replay || this.preview ? true : settings.get('noFail');
+        this.noFail = this.replay || this.preview ? true : (opts.noFail ?? settings.get('noFail'));
+        // multiplayer: everyone's song clock follows the lobby's start time
+        this.multiplayer = !!opts.multiplayer;
 
         // HUD refs + write cache (only touch the DOM when a value changes)
         this.$ = (id) => document.getElementById(id);
@@ -1565,9 +1567,12 @@ export class Gameplay {
         } else {
             audio.onSongEnd = () => { if (!this.failed) this.finish(); };
         }
-        audio.startSong(songBuffer, startAt, rate);
+        if (!this.replay && !this.preview && Number.isFinite(opts.syncStart)) startAt = opts.syncStart;
+        audio.startSong(songBuffer, Math.min(startAt, 0), rate);
         // practice: jump in a couple of seconds before the chosen moment
         if (!this.replay && this.mods.practiceStart > 0) this.seek(this.mods.practiceStart - 2.5);
+        // joined a match late: skip ahead (what you missed doesn't count)
+        else if (startAt > 0 && !this.replay && !this.preview) this.seek(startAt);
     }
 
     // the map editor draws its own notes; the preview then only runs the lights
