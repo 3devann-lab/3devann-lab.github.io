@@ -37,6 +37,32 @@ On the difficulty screen open **Modifiers & Practice**: No Fail, Instant Fail, S
 Ghost Notes, Disappearing Arrows, Small Notes, No Bombs, No Walls, song speed 0.5x–2x, and **Practice from**
 any point in the song. Practice runs and speeds below 1x don't save high scores.
 
+## Accounts & Multiplayer
+
+Turn these on by following **[FIREBASE_SETUP.md](FIREBASE_SETUP.md)** (free, about 15 minutes). Until then
+everyone plays as a guest and multiplayer stays off.
+
+- **Sign in, create an account, or continue as a guest.**
+  - Guests' settings are saved in a browser cookie.
+  - Signed in, your settings, high scores, your list of downloaded maps and your editor maps save to your
+    account and follow you to other computers.
+  - **Forgot password?** emails a reset link.
+  - **Settings → Account** changes your password or player name, and logs you out.
+- **Multiplayer** (needs an account):
+  - **Online now** lists everyone online and what they're doing.
+  - Create a lobby (public or private, 2–10 players); others join from the list or with its 5-letter code.
+  - The host picks the level from their maps or searches BeatSaver to download a custom level, then picks
+    the difficulty and modifiers.
+  - Everyone else can **suggest** levels, difficulties and modifiers; the host uses one with one click.
+  - Players who don't have the host's level get it **downloaded automatically** (progress shows in the
+    player list).
+  - Ready-up and chat.
+  - If the host leaves, the player who's been there longest takes over.
+- **Matches**: everyone starts on the same server clock.
+  - You see the other players' sabers moving beside you, with their names and scores, plus a live
+    scoreboard.
+  - Pausing doesn't stop the song (it's shared). At the end the standings update as the others finish.
+
 ## Map Editor
 
 **Map Editor** on the main menu makes Beat Saber maps from any song.
@@ -164,6 +190,10 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - `js/game.js` — 3D engine, environment, lighting, gameplay, replay playback
 - `js/menu.js` — all UI screens (incl. the replay browser)
 - `js/replayui.js` — replay viewer controls (timeline, speed, cameras, live options)
+- `js/online/` — accounts and multiplayer: `firebase.js` (loads the SDK), `account.js` (sign in, what's saved where),
+  `authui.js` (sign-in screens, Settings → Account), `multiplayer.js` (presence, lobbies, matches), `lobbyui.js` (screens),
+  `match.js` (a running match), `remote.js` (other players' sabers)
+- `js/firebase-config.js` — your Firebase project's settings; `firebase/database.rules.json` — the database rules
 - `js/editor/` — map editor: `model.js` (project data, undo, import / export), `view3d.js` (the 3D editing view), `overview.js` (the song strip),
   `editor.js` (screens, tools, playback, 3D preview, saving)
 - `js/ui.js` — shared UI pieces (toasts, setting rows, camera/replay option lists)

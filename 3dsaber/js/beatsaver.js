@@ -86,6 +86,9 @@ function simplifyDoc(doc) {
     };
 }
 
+// account.js listens here so downloads are remembered in your account
+export const libraryHooks = { onSaved: null, onDeleted: null };
+
 // ---------- Download + extract a map zip ----------
 export async function downloadMap(mapMeta, onProgress = () => {}) {
     if (!mapMeta.downloadURL) throw new Error('No download URL');
@@ -181,6 +184,7 @@ export async function downloadMap(mapMeta, onProgress = () => {}) {
         savedAt: Date.now(),
     };
     await dbPut(record);
+    if (libraryHooks.onSaved) try { libraryHooks.onSaved(record); } catch (e) { console.error(e); }
     onProgress(1, 'Done');
     return record;
 }
@@ -258,12 +262,13 @@ export async function getSavedMap(id) {
 
 export async function deleteSavedMap(id) {
     const db = await openDB();
-    return new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
         const tx = db.transaction(STORE, 'readwrite');
         tx.objectStore(STORE).delete(id);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
     });
+    if (libraryHooks.onDeleted) try { libraryHooks.onDeleted(id); } catch (e) { console.error(e); }
 }
 
 export async function isMapSaved(id) {

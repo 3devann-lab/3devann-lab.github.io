@@ -38,7 +38,7 @@ function ensureAudio() {
 window.addEventListener('pointerdown', ensureAudio);
 window.addEventListener('keydown', ensureAudio);
 
-menu.showHome();
+menu.boot();
 window.__saber = { engine, menu };   // handy for debugging from the console
 
 let lastTime = performance.now();
@@ -52,7 +52,7 @@ function loop() {
     if (!audioReady && gamepad.curr.some(Boolean)) ensureAudio();
 
     const gp = menu.gameplay;
-    if (gp && !gp.paused && !gp.finished) {
+    if (gp && !gp.paused && !gp.finished && !(menu.match && document.querySelector('.mp-match-menu'))) {
         if (gamepad.justPressed(Buttons.START)) menu.pauseGame();
     } else {
         cursor.update(dt);
@@ -60,6 +60,7 @@ function loop() {
     }
     if (menu.replayControls && menu.gameplay) menu.replayControls.update(dt);
     if (menu.editor.active) menu.editor.update(dt);
+    if (menu.match) menu.match.update(dt);
 
     engine.update();
 }

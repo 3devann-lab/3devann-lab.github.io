@@ -20,6 +20,10 @@ import {
 } from './beatleader.js';
 import { ReplayControls } from './replayui.js';
 import { Editor } from './editor/editor.js';
+import { account } from './online/account.js';
+import { showAuth, accountSection } from './online/authui.js';
+import { mp } from './online/multiplayer.js';
+import { LobbyUI } from './online/lobbyui.js';
 import {
     toast, esc, fmt, settingBuilders, PLAY_CAMERA_ROWS, FIRST_PERSON_ROWS, FOLLOW_ROWS, REPLAY_VIEW_ROWS,
     CONTROL_ROWS, MOD_ROWS, SOUND_ROWS, LOOK_ROWS, HUD_ROWS,
@@ -70,6 +74,9 @@ export class Menu {
         this.objectUrls = [];
         this.editor = new Editor(this);
         this.returnTo = null;       // {editor: projectId} while test-playing from the editor
+        this.lobbyUi = new LobbyUI(this);
+        account.on(() => this.onAccountChange());
+        account.onBeforeSignOut = () => mp.stopPresence();
 
         gamepad.on('connect', () => {
             this.updateControllerChip();
@@ -81,7 +88,7 @@ export class Menu {
         gamepad.on('disconnect', () => {
             this.updateControllerChip();
             toast('Controller disconnected', 'error');
-            if (this.gameplay && !this.gameplay.replay && !this.gameplay.paused && !this.gameplay.finished) this.pauseGame();
+            if (this.gameplay && !this.gameplay.replay && !this.gameplay.paused && !this.gameplay.finished && !this.match) this.pauseGame();
         });
 
         window.addEventListener('keydown', (e) => {
@@ -90,13 +97,14 @@ export class Menu {
             if (!gp || gp.finished || gp.replay) return;      // replays: ReplayControls has the keys
             if (e.key === 'Escape') {
                 e.preventDefault();
-                gp.paused ? this.resumeGame() : this.pauseGame();
+                if (this.match) this.lobbyUi.showMatchMenu();
+                else gp.paused ? this.resumeGame() : this.pauseGame();
             }
         });
 
         // pause automatically when the tab is hidden (audio clock keeps running otherwise)
         document.addEventListener('visibilitychange', () => {
-            if (document.hidden && this.gameplay && !this.gameplay.paused && !this.gameplay.finished) this.pauseGame();
+            if (document.hidden && this.gameplay && !this.gameplay.paused && !this.gameplay.finished && !this.match) this.pauseGame();
         });
 
         // click sounds for all UI buttons
@@ -128,15 +136,59 @@ export class Menu {
         $('hint-bar').classList.toggle('hidden', !gamepad.connected);
     }
 
+    // ============ START-UP ============
+    // restore a saved sign-in (or ask: sign in / create account / guest)
+    async boot() {
+        this.setScreen('<div class="screen"><div class="loading-spinner"></div></div>');
+        await account.init();
+        if (account.state === 'signedout') showAuth(this, 'signin');
+        else this.showHome();
+    }
+
+    // signed in / out: everything that depends on settings follows the new ones
+    onAccountChange() {
+        this.applyAllSettings();
+        if (account.signedIn) mp.startPresence();
+        const chip = $('account-chip');
+        if (chip) this.renderAccountChip();
+    }
+
+    applyAllSettings() {
+        const s = settings;
+        this.engine.applyCameraSettings();
+        this.engine.applyVisualSettings();
+        this.engine.setBloom(s.get('bloom'));
+        this.engine.setBloomStrength(s.get('bloomStrength'));
+        this.engine.setQuality(s.get('quality'));
+        audio.setVolumes(s.get('musicVolume'), s.get('sfxVolume'));
+        cursor.speed = s.get('cursorSpeed');
+        gamepad.rumbleScale = s.num('rumble', 0, 1);
+    }
+
+    renderAccountChip() {
+        const chip = $('account-chip');
+        if (!chip) return;
+        if (account.state === 'off' || account.state === 'loading') { chip.classList.add('hidden'); return; }
+        chip.classList.remove('hidden');
+        chip.classList.toggle('signed-in', account.signedIn);
+        chip.innerHTML = account.signedIn
+            ? `<span class="account-dot">${esc((account.user.name || '?')[0].toUpperCase())}</span><span>${esc(account.user.name)}</span>`
+            : '<span class="account-dot guest">?</span><span>Guest · <b>Sign in</b></span>';
+        chip.onclick = () => (account.signedIn ? this.showSettings('sec-account') : showAuth(this, 'signin'));
+    }
+
     // ============ HOME ============
     showHome() {
+        const locked = account.state !== 'user';
         this.setScreen(`
         <div class="screen">
             <div id="controller-chip"><span class="dot"></span><span>Connect a controller</span></div>
+            <button id="account-chip" class="hidden"></button>
             <h1 id="title">SABER//3D</h1>
             <div id="subtitle">Rhythm · Slash · Flow</div>
             <div class="menu-buttons">
                 <button class="btn primary" id="btn-play">Play</button>
+                <button class="btn ${locked ? 'locked' : ''}" id="btn-multi" title="${locked ? 'Sign in to play multiplayer' : 'Play with other people'}">Multiplayer${locked ? ' <span class="lock">🔒</span>' : ''}</button>
                 <button class="btn" id="btn-custom">Custom Levels</button>
                 <button class="btn" id="btn-replays">Replays</button>
                 <button class="btn" id="btn-editor">Map Editor</button>
@@ -144,8 +196,10 @@ export class Menu {
             </div>
         </div>`);
         this.updateControllerChip();
+        this.renderAccountChip();
         this.enterMenuMode(null);
         $('btn-play').onclick = () => this.showSongs();
+        $('btn-multi').onclick = () => this.lobbyUi.show();
         $('btn-custom').onclick = () => this.showBrowse();
         $('btn-replays').onclick = () => this.showReplays();
         $('btn-editor').onclick = () => { this.returnTo = null; this.editor.showProjects(); };
@@ -168,10 +222,40 @@ export class Menu {
         $('btn-back').onclick = () => this.showHome();
 
         const list = $('song-list');
-        const saved = await getSavedMaps().catch(() => []);
+        const [saved] = await Promise.all([getSavedMaps().catch(() => []), account.refresh('library')]);
         if (!list.isConnected) return;
         list.innerHTML = '';
         const best = getBestScores();
+
+        // maps saved to your account that this device doesn't have yet
+        const missing = account.signedIn ? account.missingMaps(new Set(saved.map(r => r.id))) : [];
+        if (missing.length) {
+            const bar = document.createElement('div');
+            bar.className = 'cloud-banner';
+            bar.innerHTML = `<span>☁ <b>${missing.length}</b> map${missing.length > 1 ? 's' : ''} from your account ${missing.length > 1 ? 'aren\'t' : 'isn\'t'} on this device</span>
+                <button class="btn small primary" id="cloud-dl">Download ${missing.length > 1 ? 'all' : 'it'}</button>`;
+            list.appendChild(bar);
+            $('cloud-dl').onclick = async (e) => {
+                e.stopPropagation();
+                const btn = $('cloud-dl');
+                btn.disabled = true;
+                let done = 0, failed = 0;
+                for (const m of missing) {
+                    btn.textContent = `${done + failed + 1} / ${missing.length}…`;
+                    try {
+                        const meta = await getMapByHash(m.hash);
+                        if (!meta) throw new Error('not on BeatSaver');
+                        await downloadMap(meta);
+                        done++;
+                    } catch (err) {
+                        console.error('account map download', m, err);
+                        failed++;
+                    }
+                }
+                toast(`Downloaded ${done} map${done !== 1 ? 's' : ''}${failed ? ` · ${failed} couldn't be downloaded` : ''}`, failed ? 'error' : 'success');
+                if ($('song-list')) this.showSongs();
+            };
+        }
 
         // Built-in track
         list.appendChild(this.songRow({
@@ -356,7 +440,8 @@ export class Menu {
     }
 
     // ============ START / END LEVEL ============
-    async startLevel(builtinSong, record, diff, replayCtx = null) {
+    // mpOpts: {match, mods} when the lobby starts a multiplayer match
+    async startLevel(builtinSong, record, diff, replayCtx = null, mpOpts = null) {
         if (!replayCtx && !gamepad.connected) {
             toast('Connect a controller to play — sabers are the thumbsticks', 'error');
             return;
@@ -408,7 +493,7 @@ export class Menu {
             $('hint-bar').classList.add('hidden');
             $('hud').classList.remove('hidden');
 
-            this.gameplay = new Gameplay(this.engine, mapData, songBuffer, {
+            const opts = {
                 songName,
                 njs: diff.njs,
                 offsetBeats: diff.offset,
@@ -417,15 +502,29 @@ export class Menu {
                 replay,
                 mods: replay ? null : this.currentMods(),
                 onEnd: (results) => this.endLevel(results, mapId, diff),
-            });
+            };
+            if (mpOpts) {
+                // the lobby's modifiers, and the song clock everyone shares
+                const m = mpOpts.mods || {};
+                opts.mods = {
+                    speed: Math.max(0.5, Math.min(2, Number(m.speed) || 1)), noArrows: !!m.noArrows, ghost: !!m.ghost, disappear: !!m.disappear,
+                    noBombs: !!m.noBombs, noWalls: !!m.noWalls, instantFail: !!m.instantFail, smallNotes: !!m.smallNotes, strict: !!m.strict, practiceStart: 0,
+                };
+                opts.noFail = !!m.noFail;
+                opts.multiplayer = true;
+                opts.syncStart = mpOpts.match.songTimeNow();
+            }
+            this.gameplay = new Gameplay(this.engine, mapData, songBuffer, opts);
             this.engine.gameplay = this.gameplay;
             if (replay) this.replayControls = new ReplayControls(this, this.gameplay);
+            if (mpOpts) mpOpts.match.attach(this.gameplay);
             this.checkAudioUnlocked();
         } catch (err) {
             console.error(err);
             toast('Failed to start level: ' + err.message, 'error');
             this.abortGameplay();
-            if (replayCtx) this.showReplays(); else if (this.returnTo && this.returnTo.editor) this.backToEditor(); else this.showSongs();
+            if (mpOpts) { this.lobbyUi.endMatch(); this.lobbyUi.showLobby(); }
+            else if (replayCtx) this.showReplays(); else if (this.returnTo && this.returnTo.editor) this.backToEditor(); else this.showSongs();
         }
     }
 
@@ -470,6 +569,12 @@ export class Menu {
         this.closeReplayControls();
         if (this.gameplay) { this.gameplay.destroy(); this.gameplay = null; }
         $('hud').classList.add('hidden');
+        if (this.match) {
+            const m = this.match;
+            m.finish(results);
+            this.lobbyUi.showResults(m, results, isNewBest);
+            return;
+        }
         this.showResults(results, isNewBest);
     }
 
@@ -527,6 +632,7 @@ export class Menu {
     // ============ PAUSE ============
     pauseGame() {
         if (!this.gameplay || this.gameplay.finished) return;
+        if (this.match) { this.lobbyUi.showMatchMenu(); return; }      // multiplayer: no pausing
         const gp = this.gameplay;
         gp.pause();
         if (gp.replay && this.replayControls) {
@@ -1284,7 +1390,7 @@ export class Menu {
     }
 
     // ============ SETTINGS ============
-    showSettings() {
+    showSettings(jumpTo = null) {
         const s = settings;
         this.setScreen(`
         <div class="screen panel-screen">
@@ -1292,6 +1398,7 @@ export class Menu {
                 <div class="panel-header">
                     <div class="panel-title">SETTINGS</div>
                     <div class="seg settings-jump">
+                        <button class="sort-btn" data-jump="sec-account">Account</button>
                         <button class="sort-btn" data-jump="sec-controls">Controls</button>
                         <button class="sort-btn" data-jump="sec-game">Gameplay</button>
                         <button class="sort-btn" data-jump="sec-mods">Modifiers</button>
@@ -1322,6 +1429,8 @@ export class Menu {
         this.root.querySelectorAll('[data-jump]').forEach(btn => {
             btn.onclick = () => { const el = $(btn.dataset.jump); if (el) body.scrollTop = el.offsetTop - body.offsetTop - 8; };
         });
+
+        accountSection(this, body);
 
         b.section('Controls', 'How the thumbsticks move the sabers. The stick places the middle of the blade on the note grid.',
             resetAndRedraw([...CONTROL_KEYS, 'aimAssist'], 'Controls reset')).id = 'sec-controls';
@@ -1409,15 +1518,10 @@ export class Menu {
                 return;
             }
             s.reset(ALL_KEYS);
-            this.engine.applyCameraSettings();
-            this.engine.applyVisualSettings();
-            this.engine.setBloom(s.get('bloom'));
-            this.engine.setBloomStrength(s.get('bloomStrength'));
-            this.engine.setQuality(s.get('quality'));
-            audio.setVolumes(s.get('musicVolume'), s.get('sfxVolume'));
-            cursor.speed = s.get('cursorSpeed');
+            this.applyAllSettings();
             toast('All settings reset');
             this.showSettings();
         };
+        if (jumpTo && $(jumpTo)) body.scrollTop = $(jumpTo).offsetTop - body.offsetTop - 8;
     }
 }

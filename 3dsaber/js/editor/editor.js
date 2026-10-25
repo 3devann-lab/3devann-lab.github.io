@@ -6,6 +6,7 @@ import { parseDifficulty, parseInfo } from '../beatmap.js';
 import { Gameplay } from '../game.js';
 import { getSavedMaps, idb, PROJECT_STORE, PROJECT_FILES, saveLibraryRecord, deleteSavedMap } from '../beatsaver.js';
 import { toast, esc } from '../ui.js';
+import { account } from '../online/account.js';
 import * as M from './model.js';
 import { View3D, dirFromDrag } from './view3d.js';
 import { Overview } from './overview.js';
@@ -13,17 +14,23 @@ import { Overview } from './overview.js';
 const $ = (id) => document.getElementById(id);
 
 // ---------- storage ----------
+// in this browser; maps you edit while signed in also save to your account
+// (everything but the song file, which can be large)
 const store = {
     list: () => idb(PROJECT_STORE, 'readonly', s => s.getAll()),
     get: (id) => idb(PROJECT_STORE, 'readonly', s => s.get(id)),
-    put: (p) => idb(PROJECT_STORE, 'readwrite', s => s.put(p)),
+    put: (p) => { account.saveProject(p); return idb(PROJECT_STORE, 'readwrite', s => s.put(p)); },
+    putLocal: (p) => idb(PROJECT_STORE, 'readwrite', s => s.put(p)),
     files: (id) => idb(PROJECT_FILES, 'readonly', s => s.get(id)),
     putFiles: (f) => idb(PROJECT_FILES, 'readwrite', s => s.put(f)),
     del: async (id) => {
         await idb(PROJECT_STORE, 'readwrite', s => s.delete(id));
         await idb(PROJECT_FILES, 'readwrite', s => s.delete(id));
+        await account.deleteProject(id);
     },
 };
+// projects this player may see here: their own, or ones made as a guest
+const visible = (p) => !p.owner || p.owner === account.uid;
 
 const SNAPS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
 const ARROWS = ['↑', '↓', '←', '→', '↖', '↗', '↙', '↘', '•'];
@@ -266,11 +273,15 @@ export class Editor {
         $('ed-zip').onchange = (e) => { const f = e.target.files[0]; if (f) this.importZip(f); };
         $('ed-from-lib').onclick = () => this.showLibraryPicker();
 
-        const list = await store.list().catch(() => []);
+        const [all] = await Promise.all([store.list().catch(() => []), account.refresh('projectIndex')]);
+        const list = all.filter(visible);
         const box = $('ed-projects');
         if (!box) return;
         list.sort((a, b) => b.updated - a.updated);
-        if (!list.length) {
+        // maps in your account that aren't in this browser yet
+        const local = new Set(list.map(p => p.id));
+        const cloud = account.signedIn ? Object.entries(account.projectIndex || {}).filter(([id, v]) => v && !local.has(id)) : [];
+        if (!list.length && !cloud.length) {
             box.innerHTML = `<div class="ed-empty">
                 <h3>Make your own Beat Saber maps</h3>
                 <p>Pick a song, place notes, walls, bombs and lights on a 3D track (lights and all, like in the game), and test-play it any time.
@@ -281,6 +292,27 @@ export class Editor {
             return;
         }
         box.innerHTML = '';
+        for (const [id, v] of cloud.sort((a, b) => (b[1].updated || 0) - (a[1].updated || 0))) {
+            const row = document.createElement('div');
+            row.className = 'ed-proj cloud';
+            row.innerHTML = `
+                <div class="ed-proj-cover cloud-cover">☁</div>
+                <div class="ed-proj-info">
+                    <div class="song-name">${esc(v.name)}</div>
+                    <div class="song-artist">${esc(v.artist || '')} · mapped by ${esc(v.mapper || 'you')}</div>
+                    <div class="ed-proj-diffs"><span class="badge">In your account</span> <span class="ed-proj-meta">${v.notes || 0} notes · edited ${new Date(v.updated || 0).toLocaleString()}</span></div>
+                </div>
+                <div class="ed-proj-btns"><button class="btn small primary" data-a="get">Open</button><button class="btn small danger" data-a="del">Delete</button></div>`;
+            row.querySelector('[data-a="get"]').onclick = () => this.openCloudProject(id, v);
+            const del = row.querySelector('[data-a="del"]');
+            del.onclick = async () => {
+                if (del.dataset.armed !== '1') { del.dataset.armed = '1'; del.textContent = 'Really delete?'; return; }
+                await account.deleteProject(id);
+                toast('Map deleted from your account');
+                this.showProjects();
+            };
+            box.appendChild(row);
+        }
         for (const p of list) {
             const row = document.createElement('div');
             row.className = 'ed-proj';
@@ -326,6 +358,39 @@ export class Editor {
             };
             box.appendChild(row);
         }
+    }
+
+    // a map saved in your account but not in this browser: its notes come from
+    // the account, the song file from you (it isn't stored online)
+    async openCloudProject(id, v) {
+        let p;
+        try { p = await account.loadProject(id); } catch (err) { toast('Couldn\'t load it: ' + err.message, 'error'); return; }
+        if (!p) { toast('That map is no longer in your account', 'error'); this.showProjects(); return; }
+        const bd = this.modal(`<h2>${esc(p.info.songName)}</h2>
+            <div class="sub">The notes are in your account, but songs are kept on the computer they were added on.
+            Choose the song file for this map${v && v.ext ? ` (it was a .${esc(v.ext)} file)` : ''} to keep editing.</div>
+            <div class="ed-form"><label class="ed-field"><span>Song file</span><input type="file" id="cp-song" accept="audio/*,.egg,.ogg,.mp3,.wav"></label>
+            <div class="ed-song-status" id="cp-status"></div></div>
+            <button class="btn small modal-close">Cancel</button>`);
+        bd.querySelector('#cp-song').onchange = async (e) => {
+            const f = e.target.files[0];
+            if (!f) return;
+            const st = bd.querySelector('#cp-status');
+            st.textContent = 'Reading the song…';
+            try {
+                const songBuf = await f.arrayBuffer();
+                const decoded = await audio.decode(songBuf, { allowStream: false });
+                p.song = { ...(p.song || {}), ext: (f.name.split('.').pop() || 'ogg').toLowerCase(), duration: decoded.duration };
+                await store.putFiles({ id: p.id, songBuf, coverBlob: null });
+                p.hasCover = false;
+                p.thumb = p.thumb || await thumbOf(await makeCover(p));
+                await store.putLocal(p);
+                bd.remove();
+                this.openProject(p.id, decoded);
+            } catch (err) {
+                st.textContent = 'Couldn\'t read that file: ' + err.message;
+            }
+        };
     }
 
     // =====================================================================
@@ -483,9 +548,15 @@ export class Editor {
         const m = this.menu;
         m.setScreen('<div class="screen"><div class="loading-spinner"></div><div class="browse-msg small-msg">Opening the map…</div></div>');
         try {
-            const p = await store.get(id);
+            let p = await store.get(id);
             const files = await store.files(id);
             if (!p || !files) throw new Error('map not found');
+            await account.refresh('projectIndex');
+            const idx = account.signedIn && account.projectIndex[id];
+            if (idx && (p.owner === account.uid || !p.owner) && (idx.updated || 0) > (p.updated || 0) + 1000) {
+                const newer = await account.loadProject(id).catch(() => null);      // edited on another device
+                if (newer) { p = newer; await store.putLocal(p); }
+            }
             this.project = p;
             this.files = files;
             if (!this.songBuffer || this._songFor !== id) {
