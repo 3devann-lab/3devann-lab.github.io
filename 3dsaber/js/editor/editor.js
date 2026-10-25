@@ -4,7 +4,7 @@ import { cursor, gamepad } from '../input.js';
 import { settings } from '../settings.js';
 import { parseDifficulty, parseInfo } from '../beatmap.js';
 import { Gameplay } from '../game.js';
-import { getSavedMaps, idb, PROJECT_STORE, PROJECT_FILES, saveLibraryRecord, deleteSavedMap } from '../beatsaver.js';
+import { getSavedMaps, loadFullMap, idb, PROJECT_STORE, PROJECT_FILES, saveLibraryRecord, deleteSavedMap } from '../beatsaver.js';
 import { toast, esc } from '../ui.js';
 import { account } from '../online/account.js';
 import * as M from './model.js';
@@ -510,8 +510,8 @@ export class Editor {
         bd.addEventListener('click', (e) => { if (e.target === bd || e.target.closest('.modal-close')) close(); });
         bd.querySelectorAll('[data-i]').forEach(b => {
             b.onclick = async () => {
-                const rec = maps[Number(b.dataset.i)];
                 close();
+                const rec = await loadFullMap(maps[Number(b.dataset.i)]);
                 await this.importMap({ infoRaw: rec.infoRaw, diffFiles: rec.diffFiles, songBuf: rec.songBuf, coverBlob: rec.coverBlob,
                     songExt: (rec.info.songFilename || 'song.egg').split('.').pop() });
             };

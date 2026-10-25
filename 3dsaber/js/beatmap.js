@@ -1,8 +1,14 @@
 // ============ Beat Saber map parsing: Info.dat + difficulty files ============
-// Supports v2.x, v3.x and v4.x beatmaps, Chroma colors, and Noodle Extensions:
-// coordinates, per-object NJS/offset, tracks, full animations, custom events
-// (AnimateTrack / AssignPathAnimation / AssignTrackParent / AssignPlayerToTrack),
-// fake notes/bombs/walls/chains, world + local rotation, angle offsets.
+// Supports v2.x, v3.x and v4.x beatmaps, 360/90 degree rotation events, and the
+// mapping mods:
+// - Noodle Extensions: coordinates, per-object NJS/offset, tracks, full
+//   animations, custom events (AnimateTrack / AssignPathAnimation /
+//   AssignTrackParent / AssignPlayerToTrack), fake objects, world + local
+//   rotation, links, flips, bad-cut switches
+// - Chroma: object and light colours, light IDs, gradients, transitions,
+//   environment geometry with lights and animated materials, fog
+// - Mapping Extensions: extra and precise lanes/layers, any-angle notes, precise
+//   wall width/height/start height, precise rotation events
 // Pure JS (no DOM) so it can be tested headlessly.
 
 export const CUT_DIR = {
@@ -34,6 +40,70 @@ function colorAlpha(c) {
     return Array.isArray(c) && c.length >= 4 ? Math.max(0, num(c[3], 1)) : 1;
 }
 
+// ---------- Mapping Extensions ----------
+// Lanes/layers of ±1000 and beyond are "precise": 1/1000ths of a lane, with
+// 1000 and -1000 both meaning lane 0. Plain values outside 0–3 / 0–2 are extra
+// lanes and need nothing special.
+function meLane(v) {
+    v = num(v);
+    if (v >= 1000) return v / 1000 - 1;
+    if (v <= -1000) return v / 1000 + 1;
+    return v;
+}
+function meLayer(v) {
+    v = num(v);
+    return v >= 1000 || v <= -1000 ? v / 1000 - 1 : v;
+}
+// wall heights (layers): precise ±1000 like lanes, but -1000 is height 1
+function meHeight(v, fallback) {
+    v = num(v, fallback);
+    if (v >= 1000) return v / 1000 - 1;
+    if (v <= -1000) return v / 1000 + 2;
+    return v;
+}
+// cut direction 1000–1360: an arrow at any angle (degrees clockwise from a
+// down cut); 2000–2360: a dot note turned to an angle
+function meCut(d) {
+    d = num(d, 8);
+    if (d >= 1000 && d <= 1360) return { dir: 1, angle: 1000 - d, angleAbs: true, me: true };
+    if (d >= 2000 && d <= 2360) return { dir: 8, angle: 2000 - d, angleAbs: true, me: true };
+    return null;
+}
+const isMeValue = (v) => typeof v === 'number' && (v >= 1000 || v <= -1000);
+
+// v2 wall _type 1000–4000: precise height; 4001–4005000: height + start height
+// (ME's own formulas, including its slightly-high placement)
+function meWallType(type) {
+    if (!(type >= 1000 && type <= 4005000)) return null;
+    let height, start = 0;
+    if (type >= 4001) { const v = type - 4001; height = Math.floor(v / 1000); start = v % 1000; }
+    else height = type - 1000;
+    return { h: height / 1000 * 5, y: Math.trunc(start / 750 * 5 * 1000 + 1334) / 1000 - 1 };
+}
+
+// Noodle coordinates / size entries may be null or missing: keep the vanilla value
+function coord(arr, i, fallback) {
+    const v = Array.isArray(arr) ? arr[i] : undefined;
+    if (v == null) return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+// Chroma lightID: a number or a list of them
+function lightIds(v) {
+    if (v == null) return null;
+    const out = (Array.isArray(v) ? v : [v]).map(Number).filter(Number.isFinite);
+    return out.length ? out : null;
+}
+
+// 360/90 degree maps: rotation event values 0–7, or ME's precise 1000–1720
+const ROT_VALUES = [-60, -45, -30, -15, 15, 30, 45, 60];
+function rotationDegrees(value) {
+    const v = Math.round(num(value));
+    if (v >= 1000 && v <= 1720) return v - 1360;
+    return ROT_VALUES[v] ?? 0;
+}
+
 // ---------- Noodle helpers ----------
 // `position` is kept apart from `offsetPosition`: on gameplay objects both are
 // offsets (v2 `_position`), but on environment pieces / parent tracks / the
@@ -55,6 +125,11 @@ const PROP_ALIASES = {
     fogOffset: ['offset', '_offset'],
     startY: ['startY', '_startY'],
     height: ['height', '_height'],
+};
+// AnimateComponent: component name -> {field -> canonical prop}
+const COMPONENT_PROPS = {
+    BloomFogEnvironment: { attenuation: 'attenuation', offset: 'fogOffset', startY: 'startY', height: 'height' },
+    TubeBloomPrePassLight: { colorAlphaMultiplier: 'colorAlphaMultiplier', bloomFogIntensityMultiplier: 'bloomFogIntensityMultiplier' },
 };
 
 function resolvePts(v, defs) {
@@ -101,10 +176,13 @@ function normVec3(v) {
     return Array.isArray(v) ? [num(v[0]), num(v[1]), num(v[2])] : null;
 }
 
-// Chroma environment enhancements: geometry objects ("custom models").
-// ID/regex lookups target base-game objects we don't have, so only
-// geometry-based entries are returned (that's what model maps use). Disabling
-// entries are inspected to decide whether the map wants the stock scenery gone.
+// Chroma environment enhancements.
+// - geometry objects ("custom models"), including ones that are lights
+//   (light shaders / ILightWithId) and ones whose material animates on a track
+// - directional lights picked by ID (they light the geometry; events drive them)
+// - fog set on the environment (BloomFogEnvironment)
+// Other ID lookups target base-game objects we don't have: disabling ones
+// decide whether the map wants our stock scenery gone.
 // Which of our stock scenery groups a disabled base-game object corresponds to
 const STOCK_GROUPS = {
     floor: /Floor|Mirror|PlayersPlace|Construction|Platform/i,
@@ -114,44 +192,96 @@ const STOCK_GROUPS = {
     lasers: /Laser/i,
     rings: /Ring/i,
 };
+const LIGHT_SHADERS = /^(OpaqueLight|TransparentLight)$/i;
+
+function parseMaterial(m, v2) {
+    if (!m || typeof m !== 'object') return null;
+    const kw = v2 ? m._shaderKeywords : m.shaderKeywords;
+    return {
+        color: normColor(v2 ? m._color : m.color),
+        alpha: Array.isArray(v2 ? m._color : m.color) ? colorAlpha(v2 ? m._color : m.color) : 1,
+        shader: String((v2 ? m._shader : m.shader) || 'Standard'),
+        track: (v2 ? m._track : m.track) != null ? String(v2 ? m._track : m.track) : null,
+        // an empty keyword list used to make Standard full-bright; Chroma turns it into "Glowing"
+        glowing: Array.isArray(kw) && kw.length === 0,
+    };
+}
 
 function parseEnvironment(cd, v2) {
     const list = (v2 ? cd._environment : cd.environment) || [];
-    const mats = (v2 ? cd._materials : cd.materials) || {};
+    const rawMats = (v2 ? cd._materials : cd.materials) || {};
+    const materials = {};
+    for (const name in rawMats) { const m = parseMaterial(rawMats[name], v2); if (m) materials[name] = m; }
     const out = [];
+    const lights = [];
     const hide = new Set();
+    let fog = null, fogTrack = null;
     for (const e of list) {
         if (!e || typeof e !== 'object') continue;
         const active = v2 ? e._active : e.active;
         const geo = v2 ? e._geometry : e.geometry;
+        const comps = (v2 ? e._components : e.components) || {};
+        const lw = comps.ILightWithId || comps._ILightWithId || null;
+        // v2 Chroma put the light ID straight on the entry
+        let lightID = lw && lw.lightID != null ? num(lw.lightID, NaN) : num(e._lightID ?? e.lightID, NaN);
+        const lightType = lw && lw.type != null ? num(lw.type, NaN) : NaN;
+        const tube = comps.TubeBloomPrePassLight || null;
+        const track = normTrack(v2 ? e._track : e.track);
         if (!geo) {
             const id = String((v2 ? e._id : e.id) ?? '');
             if (active === false) {
                 if (/^(Environment|GameCore)$|^\.\*$/.test(id)) for (const g in STOCK_GROUPS) hide.add(g);
                 for (const g in STOCK_GROUPS) if (STOCK_GROUPS[g].test(id)) hide.add(g);
+                continue;
+            }
+            const fc = comps.BloomFogEnvironment;
+            if (fc) {
+                fog = { ...(fog || {}) };
+                for (const k of ['attenuation', 'offset', 'startY', 'height']) if (fc[k] != null) fog[k === 'offset' ? 'fogOffset' : k] = num(fc[k]);
+                if (track) fogTrack = track[0];
+            }
+            // the environment's directional lights: they light everything, and
+            // lighting events (usually by ID) set their colour
+            if (/DirectionalLight/i.test(id) && lights.length < 4) {
+                lights.push({
+                    rotation: normVec3(v2 ? e._rotation : e.rotation),
+                    localRotation: normVec3(v2 ? e._localRotation : e.localRotation),
+                    track,
+                    light: { type: Number.isFinite(lightType) ? lightType : null, id: Number.isFinite(lightID) ? lightID : null },
+                });
             }
             continue;
         }
         if (active === false) continue;
-        let m = v2 ? geo._material : geo.material;
-        if (typeof m === 'string') m = mats[m];
-        m = m || {};
-        const color = v2 ? m._color : m.color;
+        let mname = v2 ? geo._material : geo.material;
+        let m = typeof mname === 'string' ? materials[mname] : parseMaterial(mname, v2);
+        if (typeof mname !== 'string') mname = null;
+        m = m || { color: null, alpha: 1, shader: 'Standard', track: null, glowing: false };
+        const isLight = LIGHT_SHADERS.test(m.shader) || !!lw;
         out.push({
             type: (v2 ? geo._type : geo.type) || 'Cube',
-            shader: (v2 ? m._shader : m.shader) || 'Standard',
-            color: normColor(color),
+            shader: m.shader,
+            color: m.color ? [...m.color, m.alpha] : null,
+            material: mname,                          // shared by name (animated by the material's track)
+            glowing: m.glowing,
             position: normVec3(v2 ? e._position : e.position),
             rotation: normVec3(v2 ? e._rotation : e.rotation),
             localPosition: normVec3(v2 ? e._localPosition : e.localPosition),
             localRotation: normVec3(v2 ? e._localRotation : e.localRotation),
             scale: normVec3(v2 ? e._scale : e.scale),
-            track: normTrack(v2 ? e._track : e.track),
+            track,
+            // a light: lighting events of its type (and ID, when they name one) drive it
+            light: isLight ? { type: Number.isFinite(lightType) ? lightType : 0, id: Number.isFinite(lightID) ? lightID : null } : null,
+            bloom: tube && tube.colorAlphaMultiplier != null ? num(tube.colorAlphaMultiplier, 1) : 1,
         });
     }
     // big model maps bring their own world: hide all stock scenery
     if (out.length >= 24) { for (const g in STOCK_GROUPS) hide.add(g); hide.add('stars'); }
     out.hideGroups = [...hide];
+    out.materials = materials;
+    out.lights = lights;
+    out.fog = fog;
+    out.fogTrack = fogTrack;
     return out;
 }
 
@@ -178,9 +308,21 @@ function parseEventCustom(cd, v2) {
         prop: pick('_prop', 'prop') ?? null,
         speed: pick('_speed', 'speed') ?? (v2 ? cd._preciseSpeed ?? null : null),
         direction: pick('_direction', 'direction') ?? null,
+        lockRotation: !!(v2 ? cd._lockPosition : cd.lockRotation),
+        nameFilter: pick('_nameFilter', 'nameFilter') ?? null,
     };
     return (custom.rotation !== null || custom.step !== null || custom.speed !== null ||
-            custom.direction !== null || custom.prop !== null) ? custom : null;
+            custom.direction !== null || custom.prop !== null || custom.lockRotation || custom.nameFilter !== null) ? custom : null;
+}
+
+// Chroma lighting-event extras shared by v2 and v3
+function lightExtras(cd, v2) {
+    if (!cd) return { lightIDs: null, easing: null, hsv: false };
+    return {
+        lightIDs: lightIds(v2 ? cd._lightID : cd.lightID),
+        easing: (v2 ? cd._easing : cd.easing) || null,
+        hsv: /hsv/i.test(String((v2 ? cd._lerpType : cd.lerpType) || '')),
+    };
 }
 
 // Point definitions: v2 [{_name,_points}], v3 {name: points}
@@ -225,14 +367,20 @@ function parseCustomEvents(list, clock, defs, v2) {
         if (type === 'AssignTrackParent') {
             parsed.parent = String((v2 ? d._parentTrack : d.parentTrack) ?? '');
             parsed.children = (normTrack(v2 ? d._childrenTracks : d.childrenTracks) || []);
+            parsed.worldPositionStays = !!(v2 ? d._worldPositionStays : d.worldPositionStays);
         } else if (type === 'AnimateComponent') {
-            // Chroma v3: animate fog via BloomFogEnvironment component
-            const comp = (v2 ? d._components : d.components) || {};
-            const fog = comp.BloomFogEnvironment || comp._BloomFogEnvironment || {};
+            // Chroma: animate the fog (BloomFogEnvironment) or light glow
+            // (TubeBloomPrePassLight). Components sit right in the event data
+            // (older maps nest them under "components").
+            const nested = (v2 ? d._components : d.components) || {};
             const props = {};
-            for (const k of ['attenuation', 'offset', 'startY', 'height']) {
-                const pts = resolvePts(fog[k], defs);
-                if (pts) props[k === 'offset' ? 'fogOffset' : k] = pts;
+            for (const cname in COMPONENT_PROPS) {
+                const comp = d[cname] || d['_' + cname] || nested[cname] || nested['_' + cname];
+                if (!comp || typeof comp !== 'object') continue;
+                for (const field in COMPONENT_PROPS[cname]) {
+                    const pts = resolvePts(comp[field] ?? comp['_' + field], defs);
+                    if (pts != null) props[COMPONENT_PROPS[cname][field]] = pts;
+                }
             }
             parsed.props = props;
         } else {
@@ -429,6 +577,21 @@ function angleFields(dir, offsetDeg, absoluteDeg) {
     return off ? { angle: off, angleAbs: false } : { angle: 0, angleAbs: false };
 }
 
+// Noodle note switches (v3 names; v2 the same with a leading underscore)
+function noteFlags(cd, v2) {
+    const g = (k) => (v2 ? cd['_' + k] : cd[k]);
+    const flip = g('flip');
+    return {
+        link: g('link') != null ? String(g('link')) : null,
+        flip: Array.isArray(flip) ? [num(flip[0]), num(flip[1])] : null,
+        noBadDirection: !!g('disableBadCutDirection'),
+        noBadSpeed: !!g('disableBadCutSpeed'),
+        noBadSaber: !!g('disableBadCutSaberType'),
+        // Chroma: no debris when cut
+        noDebris: !!(cd.disableDebris || cd._disableDebris),
+    };
+}
+
 // --- v2 ---
 function parseV2(map, baseBpm, regions) {
     const bpmEvents = [];
@@ -445,17 +608,19 @@ function parseV2(map, baseBpm, regions) {
 
     const notes = [];
     const bombs = [];
+    let me = false;
     for (const n of (map._notes || [])) {
         if (!n) continue;
         const cd = n._customData || {};
-        let x = num(n._lineIndex), y = num(n._lineLayer);
+        let x = meLane(n._lineIndex), y = meLayer(n._lineLayer);
+        if (isMeValue(n._lineIndex) || isMeValue(n._lineLayer)) me = true;
         if (Array.isArray(cd._position)) {          // Noodle: [lineIndex-2, lineLayer]
-            x = num(cd._position[0]) + 2;
-            y = num(cd._position[1]);
+            x = coord(cd._position, 0, x - 2) + 2;
+            y = coord(cd._position, 1, y);
         }
         const time = clock.toSeconds(num(n._time));
         const common = {
-            time, x, y,
+            time, beat: num(n._time), x, y,
             lx: num(n._lineIndex), ly: num(n._lineLayer),
             njs: num(cd._noteJumpMovementSpeed) || null,
             spawnOffset: cd._noteJumpStartBeatOffset ?? null,
@@ -465,17 +630,19 @@ function parseV2(map, baseBpm, regions) {
             track: normTrack(cd._track),
             anim: normAnim(cd._animation, defs),
             noGravity: !!cd._disableNoteGravity,
+            chroma: normColor(cd._color),
+            ...noteFlags(cd, true),
         };
         if (n._type === 3) {
             bombs.push(common);
         } else if (n._type === 0 || n._type === 1) {
             const dir = n._cutDirection ?? 8;
+            const mc = meCut(dir);
+            if (mc) me = true;
             notes.push({
                 ...common,
                 color: n._type,
-                dir: dir >= 0 && dir <= 8 ? dir : 8,
-                ...angleFields(dir, 0, cd._cutDirection),
-                chroma: normColor(cd._color),
+                ...(mc || { dir: dir >= 0 && dir <= 8 ? dir : 8, ...angleFields(dir, 0, cd._cutDirection) }),
             });
         }
     }
@@ -484,20 +651,24 @@ function parseV2(map, baseBpm, regions) {
     for (const o of (map._obstacles || [])) {
         if (!o) continue;
         const cd = o._customData || {};
-        let x = num(o._lineIndex), y, h;
-        if (o._type === 2) { y = num(o._lineLayer); h = num(o._height, 5) || 5; }
-        else if (o._type === 1) { y = 2; h = 3; }   // crouch
+        let x = meLane(o._lineIndex), y, h;
+        const type = num(o._type);
+        const mw = meWallType(type);
+        if (mw) { y = mw.y; h = mw.h; me = true; }
+        else if (type === 2) { y = meLayer(o._lineLayer); h = meHeight(o._height, 5); }
+        else if (type === 1) { y = 2; h = 3; }       // crouch
         else { y = 0; h = 5; }                       // full height
-        let w = num(o._width, 1), l = null;
-        if (Array.isArray(cd._position)) { x = num(cd._position[0]) + 2; y = num(cd._position[1]); }
+        let w = meLane(num(o._width, 1)), l = null;
+        if (isMeValue(o._lineIndex) || isMeValue(o._width)) me = true;
+        if (Array.isArray(cd._position)) { x = coord(cd._position, 0, x - 2) + 2; y = coord(cd._position, 1, y); }
         if (Array.isArray(cd._scale)) {
-            w = num(cd._scale[0], w) || w;
-            h = num(cd._scale[1], h) || h;
+            w = coord(cd._scale, 0, w) || w;
+            h = coord(cd._scale, 1, h) || h;
             if (cd._scale[2] != null) l = num(cd._scale[2]);
         }
         const start = num(o._time);
         walls.push({
-            time: clock.toSeconds(start),
+            time: clock.toSeconds(start), beat: start,
             duration: Math.max(0, clock.toSeconds(start + num(o._duration)) - clock.toSeconds(start)),
             x, y, w, h, l,
             chroma: normColor(cd._color),
@@ -512,9 +683,16 @@ function parseV2(map, baseBpm, regions) {
     }
 
     const events = [];
+    const rotations = [];
     for (const ev of (map._events || [])) {
-        if (!ev || ev._type === 100 || ev._type === 14 || ev._type === 15) continue;
+        if (!ev || ev._type === 100) continue;
         const cd = ev._customData || {};
+        if (ev._type === 14 || ev._type === 15) {     // 360/90: early / late lane rotation
+            const deg = cd._rotation != null ? num(cd._rotation) : rotationDegrees(ev._value);
+            if (num(ev._value) >= 1000) me = true;
+            rotations.push({ time: clock.toSeconds(num(ev._time)), early: ev._type === 14, deg });
+            continue;
+        }
         const value = num(ev._value);
         const out = {
             time: clock.toSeconds(num(ev._time)),
@@ -524,6 +702,7 @@ function parseV2(map, baseBpm, regions) {
             chroma: normColor(cd._color),
             gradient: parseGradient(cd._lightGradient, clock, num(ev._time)),
             custom: parseEventCustom(ev._customData, true),
+            ...lightExtras(cd, true),
             legacyColor: null,
         };
         // Legacy Chroma: values >= 2e9 encode an RGB color for later events
@@ -538,7 +717,7 @@ function parseV2(map, baseBpm, regions) {
 
     const customEvents = parseCustomEvents(mapCd._customEvents, clock, defs, true);
     const environment = parseEnvironment(mapCd, true);
-    return finish({ notes, bombs, walls, events, customEvents, environment, clock });
+    return finish({ notes, bombs, walls, events, customEvents, environment, clock, rotations, me });
 }
 
 // --- v3 ---
@@ -548,12 +727,14 @@ function parseV3(map, baseBpm, regions) {
     const mapCd = map.customData || {};
     const defs = parsePointDefs(mapCd, false);
 
+    let me = false;
     const v3Common = (o, forceDecorative = false) => {
         const cd = o.customData || {};
-        let x = num(o.x), y = num(o.y);
-        if (Array.isArray(cd.coordinates)) { x = num(cd.coordinates[0]) + 2; y = num(cd.coordinates[1]); }
+        let x = meLane(o.x), y = meLayer(o.y);
+        if (isMeValue(o.x) || isMeValue(o.y)) me = true;
+        if (Array.isArray(cd.coordinates)) { x = coord(cd.coordinates, 0, x - 2) + 2; y = coord(cd.coordinates, 1, y); }
         return {
-            time: clock.toSeconds(num(o.b)),
+            time: clock.toSeconds(num(o.b)), beat: num(o.b),
             x, y,
             lx: num(o.x), ly: num(o.y),
             njs: num(cd.noteJumpMovementSpeed) || null,
@@ -564,6 +745,8 @@ function parseV3(map, baseBpm, regions) {
             track: normTrack(cd.track),
             anim: normAnim(cd.animation, defs),
             noGravity: !!cd.disableNoteGravity,
+            chroma: normColor(cd.color),
+            ...noteFlags(cd, false),
         };
     };
 
@@ -571,12 +754,12 @@ function parseV3(map, baseBpm, regions) {
     const pushNote = (n, forceDec = false) => {
         if (!n) return;
         const dir = n.d ?? 8;
+        const mc = meCut(dir);
+        if (mc) me = true;
         notes.push({
             ...v3Common(n, forceDec),
             color: n.c ?? 0,
-            dir: dir >= 0 && dir <= 8 ? dir : 8,
-            ...angleFields(dir, n.a, null),
-            chroma: normColor((n.customData || {}).color),
+            ...(mc || { dir: dir >= 0 && dir <= 8 ? dir : 8, ...angleFields(dir, n.a, null) }),
         });
     };
     for (const n of (map.colorNotes || [])) pushNote(n);
@@ -587,22 +770,25 @@ function parseV3(map, baseBpm, regions) {
     const pushChain = (c, forceDec = false) => {
         if (!c) return;
         const base = v3Common(c, forceDec);
+        const cd = c.customData || {};
         const headTime = base.time;
         const tailTime = clock.toSeconds(num(c.tb, c.b));
-        const count = Math.max(1, (c.sc || 2) - 1);
-        const squish = c.s ?? 1;
+        // a chain has at most a few dozen links; a garbage count must not hang the browser
+        const count = Math.max(1, Math.min(64, Math.round(num(c.sc, 2)) - 1));
+        const squish = num(c.s, 1);
+        let tx = c.tx != null ? meLane(c.tx) : base.x, ty = c.ty != null ? meLayer(c.ty) : base.y;
+        if (Array.isArray(cd.tailCoordinates)) { tx = coord(cd.tailCoordinates, 0, tx - 2) + 2; ty = coord(cd.tailCoordinates, 1, ty); }
         for (let i = 1; i <= count; i++) {
             const f = i / count;
             const sf = f * squish;
             notes.push({
                 ...base,
                 time: headTime + (tailTime - headTime) * f,
-                x: base.x + ((c.tx ?? base.x) - base.x) * sf,
-                y: base.y + ((c.ty ?? base.y) - base.y) * sf,
+                x: base.x + (tx - base.x) * sf,
+                y: base.y + (ty - base.y) * sf,
                 color: c.c ?? 0,
                 dir: 8,
                 angle: 0, angleAbs: false,
-                chroma: normColor((c.customData || {}).color),
                 chainLink: true,
             });
         }
@@ -619,25 +805,35 @@ function parseV3(map, baseBpm, regions) {
         if (!o) return;
         const cd = o.customData || {};
         const base = v3Common(o, forceDec);
-        let w = num(o.w, 1), h = num(o.h, 1), l = null;
+        let w = meLane(num(o.w, 1)), h = meHeight(o.h, 1), l = null;
+        if (isMeValue(o.w) || isMeValue(o.h)) me = true;
         if (Array.isArray(cd.size)) {
-            w = num(cd.size[0], w) || w;
-            h = num(cd.size[1], h) || h;
+            w = coord(cd.size, 0, w) || w;
+            h = coord(cd.size, 1, h) || h;
             if (cd.size[2] != null) l = num(cd.size[2]);   // explicit length in grid units
         }
         walls.push({
             ...base,
             duration: Math.max(0, clock.toSeconds(num(o.b) + num(o.d)) - base.time),
             w, h, l,
-            chroma: normColor(cd.color),
         });
     };
     for (const o of (map.obstacles || [])) pushWall(o);
     for (const o of (mapCd.fakeObstacles || [])) pushWall(o, true);
 
-    const events = (map.basicBeatmapEvents || []).filter(Boolean).map(ev => {
+    const rotations = (map.rotationEvents || []).filter(Boolean).map(r => ({
+        time: clock.toSeconds(num(r.b)), early: num(r.e) === 0, deg: num(r.r),
+    }));
+    const events = [];
+    for (const ev of (map.basicBeatmapEvents || [])) {
+        if (!ev) continue;
         const cd = ev.customData || {};
-        return {
+        if (ev.et === 14 || ev.et === 15) {           // older v3 maps keep rotations here
+            if (num(ev.i) >= 1000) me = true;
+            rotations.push({ time: clock.toSeconds(num(ev.b)), early: ev.et === 14, deg: cd.rotation != null ? num(cd.rotation) : rotationDegrees(ev.i) });
+            continue;
+        }
+        events.push({
             time: clock.toSeconds(num(ev.b)),
             type: ev.et,
             value: num(ev.i),
@@ -645,13 +841,14 @@ function parseV3(map, baseBpm, regions) {
             chroma: normColor(cd.color),
             gradient: null,
             custom: parseEventCustom(ev.customData, false),
+            ...lightExtras(cd, false),
             legacyColor: null,
-        };
-    });
+        });
+    }
 
     const customEvents = parseCustomEvents(mapCd.customEvents, clock, defs, false);
     const environment = parseEnvironment(mapCd, false);
-    return finish({ notes, bombs, walls, events, customEvents, environment, clock });
+    return finish({ notes, bombs, walls, events, customEvents, environment, clock, rotations, me });
 }
 
 // --- v4 (split object/metadata arrays; lighting lives in the lightshow file) ---
@@ -662,18 +859,21 @@ function parseV4(map, baseBpm, lightshowJson, regions) {
     const od = map.obstaclesData || [];
     const cdata = map.chainsData || [];
 
-    const blank = { spawnOffset: null, decorative: false, localRot: null, worldRot: null, track: null, anim: null, njs: null };
+    const blank = { spawnOffset: null, decorative: false, localRot: null, worldRot: null, track: null, anim: null, njs: null, chroma: null };
+    let me = false;
+    // v4 objects carry their 360/90 rotation (degrees) themselves
+    const rot = (o) => (num(o.r) ? [0, num(o.r), 0] : null);
     const notes = (map.colorNotes || []).map(n => {
         const d = nd[n.i || 0] || {};
         const dir = d.d ?? 8;
+        const mc = meCut(dir);
+        if (mc || isMeValue(d.x) || isMeValue(d.y)) me = true;
         return {
             ...blank,
-            time: clock.toSeconds(num(n.b)),
-            x: num(d.x, 1), y: num(d.y), lx: num(d.x, 1), ly: num(d.y),
+            time: clock.toSeconds(num(n.b)), beat: num(n.b), worldRot: rot(n),
+            x: meLane(num(d.x, 1)), y: meLayer(d.y), lx: num(d.x, 1), ly: num(d.y),
             color: d.c ?? 0,
-            dir: dir >= 0 && dir <= 8 ? dir : 8,
-            ...angleFields(dir, d.a, null),
-            chroma: null,
+            ...(mc || { dir: dir >= 0 && dir <= 8 ? dir : 8, ...angleFields(dir, d.a, null) }),
         };
     });
 
@@ -683,17 +883,19 @@ function parseV4(map, baseBpm, lightshowJson, regions) {
         if (!d || !head) continue;
         const headTime = clock.toSeconds(num(c.hb));
         const tailTime = clock.toSeconds(num(c.tb));
-        const count = Math.max(1, (d.c || 2) - 1);
-        const squish = d.s ?? 1;
+        const count = Math.max(1, Math.min(64, Math.round(num(d.c, 2)) - 1));
+        const squish = num(d.s, 1);
+        const hx = meLane(head.x), hy = meLayer(head.y);
+        const tx = d.tx != null ? meLane(d.tx) : hx, ty = d.ty != null ? meLayer(d.ty) : hy;
         for (let i = 1; i <= count; i++) {
             const f = i / count, sf = f * squish;
             notes.push({
                 ...blank,
-                time: headTime + (tailTime - headTime) * f,
-                x: num(head.x) + (num(d.tx, head.x) - num(head.x)) * sf,
-                y: num(head.y) + (num(d.ty, head.y) - num(head.y)) * sf,
+                time: headTime + (tailTime - headTime) * f, worldRot: rot(c),
+                x: hx + (tx - hx) * sf,
+                y: hy + (ty - hy) * sf,
                 lx: num(head.x), ly: num(head.y),
-                color: head.c ?? 0, dir: 8, angle: 0, angleAbs: false, chroma: null, chainLink: true,
+                color: head.c ?? 0, dir: 8, angle: 0, angleAbs: false, chainLink: true,
             });
         }
     }
@@ -702,19 +904,20 @@ function parseV4(map, baseBpm, lightshowJson, regions) {
         const d = bd[b.i || 0] || {};
         return {
             ...blank,
-            time: clock.toSeconds(num(b.b)), x: num(d.x, 1), y: num(d.y), lx: num(d.x, 1), ly: num(d.y),
+            time: clock.toSeconds(num(b.b)), beat: num(b.b), worldRot: rot(b),
+            x: meLane(num(d.x, 1)), y: meLayer(d.y), lx: num(d.x, 1), ly: num(d.y),
         };
     });
 
     const walls = (map.obstacles || []).map(o => {
         const d = od[o.i || 0] || {};
         const start = num(o.b);
+        if (isMeValue(d.x) || isMeValue(d.w) || isMeValue(d.h)) me = true;
         return {
             ...blank,
-            time: clock.toSeconds(start),
+            time: clock.toSeconds(start), beat: start, worldRot: rot(o),
             duration: Math.max(0, clock.toSeconds(start + num(d.d)) - clock.toSeconds(start)),
-            x: num(d.x), y: num(d.y), w: num(d.w, 1) || 1, h: num(d.h, 1) || 1, l: null,
-            chroma: null,
+            x: meLane(d.x), y: meLayer(d.y), w: meLane(num(d.w, 1)) || 1, h: meHeight(d.h, 1) || 1, l: null,
         };
     });
 
@@ -730,7 +933,7 @@ function parseV4(map, baseBpm, lightshowJson, regions) {
                     type: d.t ?? ev.t ?? 0,
                     value: num(d.i ?? ev.i),
                     float: num(d.f ?? ev.f, 1),
-                    chroma: null, gradient: null, custom: null, legacyColor: null,
+                    chroma: null, gradient: null, custom: null, legacyColor: null, lightIDs: null, easing: null, hsv: false,
                 };
             });
         } catch (e) { /* lightshow optional */ }
@@ -738,7 +941,55 @@ function parseV4(map, baseBpm, lightshowJson, regions) {
 
     const environment = [];
     environment.hideGroups = [];
-    return finish({ notes, bombs, walls, events, customEvents: [], environment, clock });
+    // the player turns with the objects' own rotations
+    const rotations = [];
+    for (const o of [...notes, ...bombs, ...walls]) if (o.worldRot) rotations.push({ time: o.time, early: true, deg: 0, abs: o.worldRot[1] });
+    return finish({ notes, bombs, walls, events, customEvents: [], environment, clock, rotations, me });
+}
+
+// 360/90 degree maps: each object spawns at the lane rotation in effect at its
+// time (early rotations count for objects on the same beat, late ones don't).
+// Noodle's own world rotation wins over it.
+function applyRotations(data) {
+    const evs = (data.rotations || []).filter(r => Number.isFinite(r.time)).sort((a, b) => a.time - b.time);
+    data.rotations = [];
+    if (!evs.length) return;
+    if (evs.some(r => r.abs != null)) {          // v4: absolute per object
+        for (const r of evs) data.rotations.push({ time: r.time, yaw: r.abs });
+        return;
+    }
+    const times = [], cum = [];
+    let total = 0;
+    for (const r of evs) { total += r.deg; times.push(r.time); cum.push(total); data.rotations.push({ time: r.time, yaw: total, early: r.early }); }
+    const EPS = 1e-6;
+    const yawAt = (t) => {
+        let lo = 0, hi = evs.length;            // first event at or after t - EPS
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (times[mid] < t - EPS) lo = mid + 1; else hi = mid; }
+        let y = lo > 0 ? cum[lo - 1] : 0;
+        for (let i = lo; i < evs.length && evs[i].time <= t + EPS; i++) if (evs[i].early) y += evs[i].deg;
+        return y;
+    };
+    for (const list of [data.notes, data.bombs, data.walls]) {
+        for (const o of list) {
+            if (o.worldRot) continue;
+            const y = yawAt(o.time);
+            if (y) o.worldRot = [0, y, 0];
+        }
+    }
+}
+
+// v3 transition events (value 4/8/12) fade from the event before them: link
+// each event to the transition that follows it on the same lights
+function linkTransitions(events) {
+    const last = new Map();
+    for (const ev of events) {
+        if (ev.type > 4 && ev.type !== 6 && ev.type !== 7 && ev.type !== 10 && ev.type !== 11) continue;
+        const key = ev.type + '|' + (ev.lightIDs ? ev.lightIDs.join(',') : '*');
+        const v = Math.round(ev.value);
+        const prev = last.get(key);
+        if (prev && (v === 4 || v === 8 || v === 12)) prev.transitionTo = ev;
+        last.set(key, ev);
+    }
 }
 
 function finish(data) {
@@ -749,6 +1000,12 @@ function finish(data) {
     data.customEvents.sort((a, b) => a.time - b.time);
     if (!data.environment) data.environment = [];
     if (!data.environment.hideGroups) data.environment.hideGroups = [];
+    applyRotations(data);
+    linkTransitions(data.events);
+    // Noodle choreography: object timing must match the map exactly
+    data.noodle = data.customEvents.length > 0 ||
+        [data.notes, data.bombs, data.walls].some(list => list.some(o => o.anim || o.track || o.njs || o.spawnOffset != null));
+    data.me = !!data.me;
     return data;
 }
 

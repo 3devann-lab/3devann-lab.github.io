@@ -168,10 +168,34 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - Main menu, song select, results screens, pause menu — all controller-navigable
 - **Custom Levels**: search BeatSaver, download maps (song + cover + all difficulties) straight into the browser; they're stored offline in IndexedDB
 - Supports v2, v3 and v4 beatmaps, all difficulties and characteristics, BPM changes (incl. `BPMInfo.dat` / `AudioData.dat` regions), chains and angle offsets
-- **Chroma** note/light/wall colors, gradients, legacy RGB events, environment geometry ("model maps"), fog
-- **Noodle Extensions**: coordinates, world/local rotation, per-object NJS/offset, fake objects, `disableNoteGravity`,
-  tracks with AnimateTrack / AssignPathAnimation (with blend durations) / AssignTrackParent / AssignPlayerToTrack,
-  point definitions, all easings, splines, HSV color lerp, quaternion-slerped rotations
+- **360° / 90° levels**: rotation events (and v4 per-object rotations) turn where objects come from; since you
+  can't turn around with a controller, the view turns with them
+- **Chroma**:
+  - note, bomb, wall and light colours; gradients; v3 transitions with easings and HSV lerp; legacy RGB events
+  - `lightID` events, which light only the lights they name (the stock lights count 1, 2, 3… in each group)
+  - environment geometry ("model maps"):
+    - pieces with light shaders or `ILightWithId` are real lights that events turn on, colour and fade
+    - zero-width light tubes still glow
+    - `TubeBloomPrePassLight` glow, animatable with AnimateComponent
+  - named materials, animated through their track; empty `shaderKeywords` / `Glowing` render full-bright
+  - the environment's directional lights (picked by ID, duplicated, turned by tracks) light the scenery in event colours
+  - fog: BloomFogEnvironment on the environment, AnimateComponent, AssignFogTrack
+- **Noodle Extensions**:
+  - coordinates (null entries keep the vanilla lane), world/local rotation, per-object NJS/offset, fake objects
+  - `disableNoteGravity`, `link` (cutting one cuts them all), `flip`, `disableBadCut…` switches
+  - tracks with AnimateTrack / AssignPathAnimation (with blend durations) / AssignTrackParent (incl.
+    `worldPositionStays`) / AssignPlayerToTrack; player tracks follow their parents
+  - point definitions with all easings, splines, HSV colour lerp, quaternion-slerped rotations, modifiers
+    (`opAdd` / `opSub` / `opMul` / `opDiv`) and base values (`baseHeadPosition`, `baseNote0Color`, …)
+  - Noodle maps play at the map's own note speed and spawn timing (the Note Speed setting would break their
+    choreography)
+- **Mapping Extensions**:
+  - extra lanes and layers, precise placement (±1000 values)
+  - any-angle notes (cut directions 1000–1360, rotated dots 2000–2360)
+  - precise wall width / height / start height (v2 `_type` 1000–4005000, v3 `w`/`h`)
+  - precise 360° rotation values
+  - the sabers reach further on maps that go past the normal grid
+- Not supported: Vivify (Unity asset bundles), and moving or copying the base game's own scenery by ID
 - Full lighting-event playback (lasers, rings, flashes) with bloom post-processing
 - Scoring with combo multiplier (x1–x8), accuracy, ranks (SS–D), per-map high scores
 - Energy bar with fail — or turn on **No Fail** in settings
@@ -191,7 +215,11 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - **Overload Protection**: if a map pushes the GPU into very slow frames (the step before a driver reset can
   take the whole browser down), the level switches to lighter graphics instead of freezing
 - Songs that can't be decoded into memory (long songs on low-memory devices) are decoded at a lower sample
-  rate, or streamed, instead of failing with "Unable to decode audio data"
+  rate, or streamed, instead of failing with "Unable to decode audio data". Long songs, or any song on a
+  device with 4 GB of memory or less, decode at 32 kHz from the start (a third less memory)
+- The library keeps each map's summary apart from its song and difficulty files: lists and searches never load
+  every downloaded song into memory at once (that could crash the tab with a big library). Older libraries
+  are converted automatically
 
 - Notes, bombs, walls and effects share geometry/materials (no per-object GPU buffers); sparks and
   cut halves are pooled; per-object materials are freed as soon as an object leaves

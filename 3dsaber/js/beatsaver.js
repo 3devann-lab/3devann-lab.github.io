@@ -192,19 +192,43 @@ export async function downloadMap(mapMeta, onProgress = () => {}) {
 // ---------- IndexedDB ----------
 const DB_NAME = 'saber3d';
 const STORE = 'maps';
+// the heavy part of each map (song audio + difficulty files, often 5–40 MB) lives
+// apart from its summary, so listing the library never loads every song at once
+const FILE_STORE = 'mapFiles';
+const HEAVY = ['songBuf', 'diffFiles'];
 // editor: project data (small, saved on every edit) and its audio/cover (saved once)
 export const PROJECT_STORE = 'projects';
 export const PROJECT_FILES = 'projectFiles';
+
+function splitRecord(record) {
+    const light = { ...record }, files = { id: record.id };
+    let heavy = false;
+    for (const k of HEAVY) {
+        if (k in light) { files[k] = light[k]; delete light[k]; heavy = true; }
+    }
+    return { light, files: heavy ? files : null };
+}
 
 let dbPromise = null;        // one shared connection (opening per call was slow)
 export function openDB() {
     if (dbPromise) return dbPromise;
     dbPromise = new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, 2);
-        req.onupgradeneeded = () => {
+        const req = indexedDB.open(DB_NAME, 3);
+        req.onupgradeneeded = (e) => {
             const db = req.result;
-            for (const name of [STORE, PROJECT_STORE, PROJECT_FILES]) {
+            for (const name of [STORE, PROJECT_STORE, PROJECT_FILES, FILE_STORE]) {
                 if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: 'id' });
+            }
+            // maps used to be stored whole: move each one's song and difficulty files out
+            if (e.oldVersion >= 1 && e.oldVersion < 3) {
+                const maps = req.transaction.objectStore(STORE), files = req.transaction.objectStore(FILE_STORE);
+                maps.openCursor().onsuccess = (ev) => {
+                    const cur = ev.target.result;
+                    if (!cur) return;
+                    const { light, files: f } = splitRecord(cur.value || {});
+                    if (f) { files.put(f); cur.update(light); }
+                    cur.continue();
+                };
             }
         };
         req.onsuccess = () => {
@@ -233,15 +257,20 @@ export async function idb(storeName, mode, fn) {
 export async function saveLibraryRecord(record) { return dbPut(record); }
 
 async function dbPut(record) {
+    const { light, files } = splitRecord(record);
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE, 'readwrite');
-        tx.objectStore(STORE).put(record);
+        const tx = db.transaction([STORE, FILE_STORE], 'readwrite');
+        tx.objectStore(STORE).put(light);
+        if (files) tx.objectStore(FILE_STORE).put(files);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('storage transaction aborted'));
     });
 }
 
+// Summaries of every saved map (info, meta, cover) — no songs or difficulty
+// files; getSavedMap / loadFullMap fetch those for the one you play.
 export async function getSavedMaps() {
     const db = await openDB();
     return new Promise((resolve, reject) => {
@@ -251,20 +280,29 @@ export async function getSavedMaps() {
     });
 }
 
+// One map with everything needed to play it
 export async function getSavedMap(id) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-        const req = db.transaction(STORE, 'readonly').objectStore(STORE).get(id);
-        req.onsuccess = () => resolve(req.result || null);
-        req.onerror = () => reject(req.error);
+        const tx = db.transaction([STORE, FILE_STORE], 'readonly');
+        const a = tx.objectStore(STORE).get(id), b = tx.objectStore(FILE_STORE).get(id);
+        tx.oncomplete = () => resolve(a.result ? { ...a.result, ...(b.result || {}) } : null);
+        tx.onerror = () => reject(tx.error);
     });
+}
+
+// A summary from getSavedMaps → the whole map (already whole: returned as is)
+export async function loadFullMap(rec) {
+    if (!rec || (rec.songBuf && rec.diffFiles)) return rec;
+    return (await getSavedMap(rec.id)) || rec;
 }
 
 export async function deleteSavedMap(id) {
     const db = await openDB();
     await new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE, 'readwrite');
+        const tx = db.transaction([STORE, FILE_STORE], 'readwrite');
         tx.objectStore(STORE).delete(id);
+        tx.objectStore(FILE_STORE).delete(id);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
     });
@@ -296,9 +334,9 @@ export async function findSavedByHash(hash) {
             const cur = req.result;
             if (!cur) return resolve(null);
             const v = cur.value;
-            if (v && v.meta && String(v.meta.hash || '').toLowerCase() === h) return resolve(v);
+            if (v && v.meta && String(v.meta.hash || '').toLowerCase() === h) return resolve(v.id);
             cur.continue();
         };
         req.onerror = () => reject(req.error);
-    });
+    }).then(id => (id == null ? null : getSavedMap(id)));
 }

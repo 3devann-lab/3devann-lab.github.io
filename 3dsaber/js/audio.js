@@ -152,12 +152,15 @@ class AudioEngine {
             throw new Error(`the song file is ${fmt.kind === 'empty' ? 'empty' : 'not audio (a web page)'} — try deleting and re-downloading the map`);
         }
         const errors = [];
+        // A long song decoded at full rate is 150–250 MB, enough to crash a tab
+        // on a device short on memory: decode those at 32 kHz straight away
+        // (a third less memory, no audible difference in a game)
+        const lowMem = arrayBuffer.byteLength > 12e6 || (navigator.deviceMemory && navigator.deviceMemory <= 4);
+        const at32k = async () => new OfflineAudioContext(2, 1, 32000).decodeAudioData(arrayBuffer.slice(0));
+        if (lowMem) { try { return await at32k(); } catch (e) { errors.push(e); } }
         // decodeAudioData detaches the buffer — pass a copy so callers keep theirs
         try { return await this.ctx.decodeAudioData(arrayBuffer.slice(0)); } catch (e) { errors.push(e); }
-        try {
-            const off = new OfflineAudioContext(2, 1, 32000);
-            return await off.decodeAudioData(arrayBuffer.slice(0));
-        } catch (e) { errors.push(e); }
+        if (!lowMem) { try { return await at32k(); } catch (e) { errors.push(e); } }
         if (allowStream) {
             try { return await this.streamSong(arrayBuffer, fmt.mime); } catch (e) { errors.push(e); }
         }

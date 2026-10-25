@@ -6,7 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { DIR_VECTORS, reactionTime } from './beatmap.js';
-import { TrackSystem, UNIT, setUnityRotation, unityQuat, makeFx } from './noodle.js';
+import { TrackSystem, UNIT, setUnityRotation, unityQuat, makeFx, EASINGS, BASES } from './noodle.js';
 import { NOTE_EVENT, FRAME_STRIDE, splitNoteId, cutParts, maxCutScore } from './bsor.js';
 import { audio } from './audio.js';
 import { gamepad, shapeStick } from './input.js';
@@ -250,22 +250,41 @@ const BASE_BLUE = new THREE.Color(0x2d7dff);
 const BASE_RED = new THREE.Color(0xff2d55);
 const BASE_WHITE = new THREE.Color(0xffffff);
 
-class LightGroup {
-    constructor(materials, baseIntensity = 2.2) {
-        this.materials = materials;        // emissive materials to drive
+const LIGHT_TYPES = new Set([0, 1, 2, 3, 4, 6, 7, 10, 11]);
+const _lc = new THREE.Color(), _hslA = {}, _hslB = {};
+
+// The colour a lighting event value means (blue 1–4, red 5–8, white 9–12),
+// with a Chroma colour or legacy tint on top. Returns {mode, boost} or null.
+function eventColor(out, value, chroma, legacy) {
+    const v = Math.round(Number(value) || 0);
+    let mode;
+    if (v <= 0) return { mode: 'off', boost: 1 };
+    if (v <= 4) { out.copy(BASE_BLUE); mode = ['on', 'flash', 'fade', 'on'][(v - 1) % 4]; }
+    else if (v <= 8) { out.copy(BASE_RED); mode = ['on', 'flash', 'fade', 'on'][(v - 5) % 4]; }
+    else if (v <= 12) { out.copy(BASE_WHITE); mode = ['on', 'flash', 'fade', 'on'][(v - 9) % 4]; }
+    else return null;                      // not a light value (legacy color events etc.)
+    let boost = 1;
+    if (chroma) boost = tameColor(out, chroma);
+    else if (legacy) out.copy(legacy);
+    return { mode, boost };
+}
+
+// One light: what lighting events do to it (on / flash / fade / off, Chroma
+// gradients and v3 transitions). color + level are the result.
+class LightState {
+    constructor() {
         this.color = new THREE.Color(0x2d7dff);
         this.level = 0;                    // current brightness 0..~2.3
         this.target = 0;                   // level to decay toward
         this.decay = 0;                    // per-second decay for flash/fade
-        this.base = baseIntensity;
         this.grad = null;
-        this.legacy = null;                // legacy Chroma RGB override
+        this.trans = null;                 // v3 transition toward the next event
         this._col = new THREE.Color();
-        this._lastI = -1;
     }
 
-    trigger(value, float = 1, chromaColor = null, gradient = null) {
-        let boost = 1;
+    trigger(ev, legacy = null) {
+        let chroma = ev.chroma || null;
+        const gradient = ev.gradient || null;
         if (gradient) {                        // Chroma light gradient
             this.grad = {
                 start: new THREE.Color(), end: new THREE.Color(),
@@ -273,42 +292,66 @@ class LightGroup {
             };
             tameColor(this.grad.start, gradient.start);
             tameColor(this.grad.end, gradient.end);
-            chromaColor = gradient.start;
+            chroma = gradient.start;
         } else {
             this.grad = null;
         }
-        let mode = 'off';
         const col = this._col;
-        const v = Math.round(Number(value) || 0);
-        if (v <= 0) { mode = 'off'; }
-        else if (v <= 4) { col.copy(BASE_BLUE); mode = ['on', 'flash', 'fade', 'on'][(v - 1) % 4]; }
-        else if (v <= 8) { col.copy(BASE_RED); mode = ['on', 'flash', 'fade', 'on'][(v - 5) % 4]; }
-        else if (v <= 12) { col.copy(BASE_WHITE); mode = ['on', 'flash', 'fade', 'on'][(v - 9) % 4]; }
-        else return;                           // not a light value (legacy color events etc.)
-        if (chromaColor) boost = tameColor(col, chromaColor);
-        else if (this.legacy) col.copy(this.legacy);
-
+        const res = eventColor(col, ev.value, chroma, legacy);
+        if (!res) return;
+        const { mode, boost } = res;
+        const float = ev.float ?? 1;
         const f = clamp(Number.isFinite(float) ? float : 1, 0, 1.6) * boost;
+        this.trans = null;
         if (LIGHT_OPTS.reduce) {
             if (mode !== 'off') this.color.copy(col);
             this.target = mode === 'off' ? 0 : mode === 'fade' ? f * 0.4 : f;
             this.decay = 1.2;
-            return;
+        } else {
+            switch (mode) {
+                case 'off':   this.level = 0; this.target = 0; this.decay = 0; break;
+                case 'on':    this.color.copy(col); this.level = f; this.target = f; this.decay = 0; break;
+                case 'flash': this.color.copy(col); this.level = f * 1.45; this.target = f; this.decay = 5; break;
+                case 'fade':  this.color.copy(col); this.level = f * 1.25; this.target = 0; this.decay = 2.4; break;
+            }
         }
-        switch (mode) {
-            case 'off':   this.level = 0; this.target = 0; this.decay = 0; break;
-            case 'on':    this.color.copy(col); this.level = f; this.target = f; this.decay = 0; break;
-            case 'flash': this.color.copy(col); this.level = f * 1.45; this.target = f; this.decay = 5; break;
-            case 'fade':  this.color.copy(col); this.level = f * 1.25; this.target = 0; this.decay = 2.4; break;
+        // the next event on these lights is a transition: glide to it
+        const to = ev.transitionTo;
+        if (to && mode !== 'flash' && mode !== 'fade' && to.time > ev.time) {
+            const end = new THREE.Color();
+            const r = eventColor(end, to.value, to.chroma, legacy);
+            if (r && r.mode !== 'off') {
+                this.trans = {
+                    from: this.color.clone(), fromLevel: this.level, to: end,
+                    toLevel: clamp(Number.isFinite(to.float) ? to.float : 1, 0, 1.6) * r.boost,
+                    start: ev.time, end: to.time, easing: to.easing, hsv: to.hsv,
+                };
+            }
         }
     }
 
     reset(level, color) {
-        this.grad = null; this.legacy = null;
+        this.grad = null; this.trans = null;
         this.color.copy(color); this.level = level; this.target = level; this.decay = 0;
     }
 
-    update(dt) {
+    update(dt, songT) {
+        if (this.trans) {
+            const tr = this.trans;
+            if (songT >= tr.end || songT < tr.start - 0.05) this.trans = null;
+            else {
+                let f = clamp((songT - tr.start) / (tr.end - tr.start), 0, 1);
+                f = EASINGS[tr.easing] ? EASINGS[tr.easing](f) : f;
+                if (tr.hsv) {
+                    tr.from.getHSL(_hslA); tr.to.getHSL(_hslB);
+                    let dh = _hslB.h - _hslA.h;
+                    if (dh > 0.5) dh -= 1; else if (dh < -0.5) dh += 1;
+                    this.color.setHSL((_hslA.h + dh * f + 1) % 1, _hslA.s + (_hslB.s - _hslA.s) * f, _hslA.l + (_hslB.l - _hslA.l) * f);
+                } else this.color.lerpColors(tr.from, tr.to, f);
+                this.level = this.target = tr.fromLevel + (tr.toLevel - tr.fromLevel) * f;
+                return;
+            }
+        }
         if (this.decay > 0 && this.level !== this.target) {
             this.level += (this.target - this.level) * Math.min(1, this.decay * dt * 3);
             if (Math.abs(this.level - this.target) < 0.01) this.level = this.target;
@@ -319,11 +362,82 @@ class LightGroup {
             this.color.lerpColors(this.grad.start, this.grad.end, f);
             if (f >= 1) this.grad = null;
         }
-        const intensity = Math.min(4, this.level * this.base * LIGHT_OPTS.scale);
-        for (const m of this.materials) {
-            m.emissive.copy(this.color);
-            m.emissiveIntensity = intensity;
+    }
+}
+
+// The stock scenery lights of one event type. Each light has its own state so
+// Chroma light IDs (1, 2, 3… in order) can address them one by one.
+class LightGroup {
+    constructor(materials, baseIntensity = 2.2) {
+        this.materials = materials;        // emissive materials to drive, one per light
+        this.states = materials.map(() => new LightState());
+        this.base = baseIntensity;
+        this.legacy = null;                // legacy Chroma RGB override
+    }
+
+    trigger(ev) {
+        if (ev.lightIDs) {
+            for (const id of ev.lightIDs) { const st = this.states[id - 1]; if (st) st.trigger(ev, this.legacy); }
+        } else {
+            for (const st of this.states) st.trigger(ev, this.legacy);
         }
+    }
+
+    reset(level, color) {
+        this.legacy = null;
+        for (const st of this.states) st.reset(level, color);
+    }
+
+    update(dt, songT) {
+        for (let i = 0; i < this.states.length; i++) {
+            const st = this.states[i], m = this.materials[i];
+            st.update(dt, songT);
+            m.emissive.copy(st.color);
+            m.emissiveIntensity = Math.min(4, st.level * this.base * LIGHT_OPTS.scale);
+        }
+    }
+}
+
+// Lights a map brings (Chroma geometry lights, the environment's directional
+// lights): found by event type, and by light ID when an event names one.
+// Lights with no type of their own answer to their ID on any type.
+class CustomLights {
+    constructor() {
+        this.all = [];
+        this.byType = new Map();
+        this.byKey = new Map();
+        this.byIdAnyType = new Map();
+    }
+
+    // light: {type (number|null), id (number|null), apply(state)}
+    add(light) {
+        light.state = new LightState();
+        light.state.reset(0, BASE_BLUE);
+        this.all.push(light);
+        const push = (map, key) => { if (!map.has(key)) map.set(key, []); map.get(key).push(light); };
+        if (light.type != null) push(this.byType, light.type);
+        if (light.id != null) {
+            if (light.type != null) push(this.byKey, light.type + '|' + light.id);
+            else push(this.byIdAnyType, light.id);
+        }
+        return light;
+    }
+
+    trigger(ev) {
+        if (ev.lightIDs) {
+            for (const id of ev.lightIDs) {
+                for (const L of this.byKey.get(ev.type + '|' + id) || []) L.state.trigger(ev);
+                for (const L of this.byIdAnyType.get(id) || []) L.state.trigger(ev);
+            }
+        } else {
+            for (const L of this.byType.get(ev.type) || []) L.state.trigger(ev);
+        }
+    }
+
+    reset() { for (const L of this.all) L.state.reset(0, BASE_BLUE); }
+
+    update(dt, songT) {
+        for (const L of this.all) { L.state.update(dt, songT); L.apply(L.state); }
     }
 }
 
@@ -500,13 +614,18 @@ class WallBatch {
     }
 }
 
-// Animated Chroma environment pieces (model maps can have thousands)
+// Animated Chroma environment pieces (model maps can have thousands), and
+// geometry lights (coloured per instance by their lighting events)
 class EnvBatch {
-    constructor(scene, geometry, material, proxies) {
+    constructor(scene, geometry, material, proxies, colored = false) {
         this.proxies = proxies;
         this.mesh = new THREE.InstancedMesh(geometry, material, proxies.length);
         this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
         this.mesh.frustumCulled = false;
+        if (colored) {
+            this.mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(proxies.length * 3), 3);
+            this.mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+        }
         scene.add(this.mesh);
     }
 
@@ -514,6 +633,12 @@ class EnvBatch {
         const arr = this.mesh.instanceMatrix.array;
         for (let i = 0; i < this.proxies.length; i++) arr.set(this.proxies[i].matrixWorld.elements, i * 16);
         this.mesh.instanceMatrix.needsUpdate = true;
+        if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+    }
+
+    setColor(i, r, g, b) {
+        const a = this.mesh.instanceColor.array;
+        a[i * 3] = r; a[i * 3 + 1] = g; a[i * 3 + 2] = b;
     }
 
     dispose() {
@@ -905,8 +1030,9 @@ export class Engine {
     // did — white flashes, fog, hidden scenery — sticks around)
     resetLights() {
         for (const key in this.lightGroups) this.lightGroups[key].reset(0, BASE_BLUE);
-        this.lightGroups[4].trigger(1, 0.8);
-        this.lightGroups[1].trigger(1, 0.4);
+        if (this.customLights) this.customLights.reset();
+        this.lightGroups[4].trigger({ value: 1, float: 0.8 });
+        this.lightGroups[1].trigger({ value: 1, float: 0.4 });
         this.laserSpeed = { left: 0.4, right: 0.4 };
         for (const ring of this.rings) { ring.userData.zoomOffset = 0; }
         if (this.scene.fog) this.scene.fog.density = this.baseFogDensity;
@@ -922,14 +1048,16 @@ export class Engine {
     }
 
     handleEvent(ev) {
-        const g = this.lightGroups[ev.type];
-        if (g) {
+        if (LIGHT_TYPES.has(ev.type)) {
+            const g = this.lightGroups[ev.type];
             if (ev.legacyColor) {               // legacy Chroma RGB: tints later events
+                if (!g) return;
                 if (ev.legacyColor === 'reset') g.legacy = null;
                 else { g.legacy = g.legacy || new THREE.Color(); tameColor(g.legacy, ev.legacyColor); }
                 return;
             }
-            g.trigger(ev.value, ev.float, ev.chroma, ev.gradient);
+            if (g) g.trigger(ev);
+            if (this.customLights) this.customLights.trigger(ev);
             return;
         }
         const c = ev.custom || null;
@@ -963,7 +1091,9 @@ export class Engine {
     setBloomStrength(v) { this.bloom.strength = v; }
 
     updateEnvironment(dt, t) {
-        for (const key in this.lightGroups) this.lightGroups[key].update(dt);
+        const songT = this.gameplay ? (this.gameplay.lastT || 0) : 0;
+        for (const key in this.lightGroups) this.lightGroups[key].update(dt, songT);
+        if (this.customLights) this.customLights.update(dt, songT);
 
         // lazy laser sway
         for (let i = 0; i < this.backLasers.length; i++) {
@@ -1382,8 +1512,20 @@ function median(arr, fallback) {
     return s[s.length >> 1];
 }
 
+// Chroma light pieces are often zero-width cubes: in the game the bloom pass
+// still draws them as glowing tubes. Give thin ones a width that stays visible
+// at their distance.
+function tubeThickness(mesh) {
+    const sc = mesh.scale;
+    const min = Math.max(0.05, mesh.position.length() * 0.0035);
+    if (sc.x < min && sc.y > sc.x * 4) sc.x = min;
+    if (sc.z < min && sc.y > sc.z * 4) sc.z = min;
+    if (sc.y < min && sc.x > sc.y * 4) sc.y = min;
+}
+
 // ---------- Gameplay session ----------
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _q = new THREE.Quaternion(), _m4 = new THREE.Matrix4();
+const _q2 = new THREE.Quaternion(), _eul = new THREE.Euler();
 const _e = new THREE.Euler(0, 0, 0, 'YXZ');
 const _swing = new THREE.Vector2();
 
@@ -1409,12 +1551,16 @@ export class Gameplay {
         this.mods = this.replay || this.preview ? {} : (opts.mods || {});
         this.v2 = mapData.version === 2;
 
-        const speedMult = this.replay || this.preview ? 1 : settings.get('noteSpeed');
+        // Noodle maps are choreographed to the map's own note speed and spawn
+        // timing, so those play exactly as written (no Note Speed setting)
+        this.exact = this.preview || !!mapData.noodle;
+        const speedMult = this.replay || this.exact ? 1 : settings.get('noteSpeed');
         this.speedMult = speedMult;
         this.bpm = opts.bpm || 120;
-        if (this.preview) {                       // exactly what the map says
+        this.offsetBeats = opts.offsetBeats || 0;
+        if (this.exact && !this.replay) {          // exactly what the map says
             this.njs = Math.max(1, opts.njs || 10);
-            this.rt = reactionTime(this.njs, opts.offsetBeats || 0, this.bpm);
+            this.rt = reactionTime(this.njs, this.offsetBeats, this.bpm);
         } else if (this.replay) {
             this.njs = Math.max(1, opts.njs || 10);
             const jd = this.replay.data.info.jumpDistance;
@@ -1457,6 +1603,11 @@ export class Gameplay {
             LeftHand: this.leftHandRig,
             RightHand: this.rightHandRig,
         }, { v2: this.v2 });
+
+        // 360/90 degree maps: the player turns to face where objects come from
+        this.rotations = mapData.rotations || [];
+        this.yaw = 0;
+        this.setStaticBases();
 
         this._matCache = new Map();
         this._ownMats = new Set();       // per-object materials to dispose with the session
@@ -1646,17 +1797,37 @@ export class Gameplay {
 
     // Per-note speed / reaction time (Noodle per-object njs + spawn offset)
     noteSpeed(n) {
-        if (this.replay) return n.njs ? Math.max(1, n.njs) : this.njs;
+        if (this.replay || this.exact) return n.njs ? Math.max(1, n.njs) : this.njs;
         return n.njs ? Math.max(6, Math.min(24, n.njs)) * this.speedMult : this.njs;
     }
     noteRt(n) {
+        if (n.njs == null && n.spawnOffset == null) return this.rt;
+        // the game's own half jump duration for this object's speed and offset
+        if (this.replay || this.exact) return reactionTime(this.noteSpeed(n), n.spawnOffset ?? this.offsetBeats, this.bpm);
         let rt = this.rt * (this.njs / this.noteSpeed(n));
         if (n.spawnOffset != null) rt = Math.max(0.3, rt + n.spawnOffset * (60 / this.bpm));
         return rt;
     }
-    // Notes way outside the reachable grid are scenery on Noodle maps
+    // Notes way outside the reachable grid are scenery on Noodle maps (Mapping
+    // Extensions maps put real notes out there: the sabers reach further instead)
     isReachable(n) {
+        if (!this.map.noodle || this.map.me) return true;
         return n.x >= -0.6 && n.x <= 3.6 && n.y >= -0.6 && n.y <= 2.9;
+    }
+
+    // Mapping Extensions: how far past the normal grid this map's notes go (metres)
+    gridOverflow() {
+        let minX = colX(0), maxX = colX(3), minY = layerY(0), maxY = layerY(2);
+        for (const n of this.map.notes) {
+            if (n.decorative || !this.isReachable(n) || n.anim) continue;
+            const x = colX(n.x), y = layerY(n.y);
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+        return {
+            x: Math.min(3, Math.max(maxX - colX(3), colX(0) - minX)),
+            y: Math.min(2, Math.max(maxY - layerY(2), layerY(0) - minY)),
+        };
     }
 
     // ----- Chroma environment geometry ("custom models") -----
@@ -1687,34 +1858,73 @@ export class Gameplay {
         return this._envGeoCache[key];
     }
 
-    envMaterial(shader, colorArr) {
+    envMaterial(shader, colorArr, glowing = false) {
         const c = new THREE.Color(0x8899bb);
         let alpha = 1, boost = 1;
         if (colorArr) {
             boost = tameColor(c, colorArr, 1.5);
             alpha = colorArr.length >= 4 ? clamp(Number(colorArr[3]) || 0, 0, 1) : 1;
         }
-        const key = 'e' + shader + '|' + c.getHexString() + '|' + alpha.toFixed(2) + '|' + boost.toFixed(2);
+        const key = 'e' + shader + '|' + c.getHexString() + '|' + alpha.toFixed(2) + '|' + boost.toFixed(2) + (glowing ? '|g' : '');
         let m = this._matCache.get(key);
         if (!m) {
-            if (/OpaqueLight/i.test(shader)) {
-                m = new THREE.MeshStandardMaterial({
-                    color: c.clone().multiplyScalar(0.15), emissive: c,
-                    emissiveIntensity: clamp(1.1 * boost * Math.max(alpha, 0.25), 0, 1.8),
-                    side: THREE.DoubleSide,
-                });
-            } else if (/TransparentLight|BillieWater|Water|Glow/i.test(shader)) {
-                // alpha is the glow amount in Chroma; a big white "sky" sphere at
-                // full additive opacity would otherwise white out the screen
-                m = new THREE.MeshBasicMaterial({
-                    color: c, transparent: true, opacity: clamp(0.35 * alpha * boost, 0.012, 0.4),
-                    blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
-                });
-            } else {           // Standard / BTSPillar / InterscopeConcrete / etc.
-                m = new THREE.MeshStandardMaterial({
-                    color: c, roughness: 0.45, metalness: 0.35, side: THREE.DoubleSide,
-                });
-            }
+            m = this.makeEnvMaterial(shader, c, alpha, boost, glowing);
+            this._matCache.set(key, m);
+        }
+        return m;
+    }
+
+    makeEnvMaterial(shader, c, alpha, boost, glowing) {
+        if (glowing || /^Glowing$/i.test(shader)) {
+            // full-bright, unlit (old maps' empty shader keywords, or Chroma's Glowing)
+            return new THREE.MeshBasicMaterial({ color: c, side: THREE.DoubleSide });
+        }
+        if (/OpaqueLight/i.test(shader)) {
+            return new THREE.MeshStandardMaterial({
+                color: c.clone().multiplyScalar(0.15), emissive: c,
+                emissiveIntensity: clamp(1.1 * boost * Math.max(alpha, 0.25), 0, 1.8),
+                side: THREE.DoubleSide,
+            });
+        }
+        if (/TransparentLight|BillieWater|Water|Glow/i.test(shader)) {
+            // alpha is the glow amount in Chroma; a big white "sky" sphere at
+            // full additive opacity would otherwise white out the screen
+            return new THREE.MeshBasicMaterial({
+                color: c, transparent: true, opacity: clamp(0.35 * alpha * boost, 0.012, 0.4),
+                blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+            });
+        }
+        // Standard / BTSPillar / InterscopeConcrete / etc.
+        return new THREE.MeshStandardMaterial({ color: c, roughness: 0.45, metalness: 0.35, side: THREE.DoubleSide });
+    }
+
+    // A named Chroma material is one shared material, so animating its track
+    // recolours every piece using it
+    namedMaterial(name, piece) {
+        if (!this._namedMats) this._namedMats = new Map();
+        let m = this._namedMats.get(name);
+        if (!m) {
+            const def = (this.map.environment.materials || {})[name] || {};
+            const c = new THREE.Color(0x8899bb);
+            const arr = piece.color;
+            let alpha = 1, boost = 1;
+            if (arr) { boost = tameColor(c, arr, 1.5); alpha = arr.length >= 4 ? clamp(Number(arr[3]) || 0, 0, 1) : 1; }
+            m = this.makeEnvMaterial(piece.shader, c, alpha, boost, piece.glowing);
+            this._ownMats.add(m);
+            this._namedMats.set(name, m);
+            if (def.track) this.animMats.push({ mat: m, track: def.track, base: m.color.clone() });
+        }
+        return m;
+    }
+
+    // light pieces are drawn unlit: their colour is the light's
+    lightMaterial(transparent) {
+        const key = transparent ? 'light:t' : 'light:o';
+        let m = this._matCache.get(key);
+        if (!m) {
+            m = transparent
+                ? new THREE.MeshBasicMaterial({ transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide })
+                : new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
             this._matCache.set(key, m);
         }
         return m;
@@ -1737,7 +1947,38 @@ export class Gameplay {
         this.envGeos = [];
         this.trackedEnvMeshes = [];
         this.envBatches = [];
-        if (!list || !list.length) return;
+        this.animMats = [];
+        this.envDirLights = [];
+        const engine = this.engine;
+        engine.customLights = new CustomLights();
+        if (!list) return;
+
+        // the map's fog, as the environment sets it
+        if (list.fog && list.fog.attenuation != null && this.scene.fog) {
+            this.scene.fog.density = clamp(list.fog.attenuation * 8, 0.0004, 0.25);
+            this._envFog = this.scene.fog.density;
+        }
+        if (list.fogTrack) this.tracks.fogTrackName = this.tracks.fogTrackName || list.fogTrack;
+
+        // the environment's directional lights: they light the scenery, and
+        // lighting events (by light ID) set their colour
+        for (const d of (list.lights || [])) {
+            const light = new THREE.DirectionalLight(0xffffff, 0);
+            const holder = new THREE.Object3D();
+            const rot = d.localRotation || d.rotation || [0, 0, 0];
+            setUnityRotation(holder, rot[0], rot[1], rot[2]);
+            light.target.position.set(0, 0, -1);
+            holder.add(light, light.target);
+            this.scene.add(holder);
+            const track = d.track ? d.track[0] : null;
+            if (track) this.tracks.markEnv(track);
+            this.envDirLights.push({ holder, light, track, base: holder.quaternion.clone() });
+            engine.customLights.add({
+                type: d.light.type, id: d.light.id,
+                apply: (st) => { light.color.copy(st.color); light.intensity = Math.min(3, st.level * 1.6 * LIGHT_OPTS.scale); },
+            });
+        }
+        if (!list.length) return;
 
         // Model maps place pieces 30–100m out; our default fog would swallow
         // them, so thin it while environment geometry is present.
@@ -1751,9 +1992,28 @@ export class Gameplay {
         const staticBuckets = new Map();   // material -> geometries[]
         const animBuckets = new Map();     // shape|material -> transform carriers (drawn instanced)
         const helper = new THREE.Object3D();
+        // static light pieces still need a transform carrier (they're instanced to be coloured)
+        this.envProxyRoot = new THREE.Group();
+        this.envProxyRoot.name = 'env-light-proxies';
+        this.scene.add(this.envProxyRoot);
 
         for (const e of list) {
-            const material = this.envMaterial(e.shader, e.color);
+            if (e.light) {
+                // a light: drawn instanced with its colour set by its lighting events
+                const transparent = /Transparent/i.test(e.shader);
+                const material = this.lightMaterial(transparent);
+                const key = 'L|' + String(e.type) + '|' + (transparent ? 't' : 'o');
+                if (!animBuckets.has(key)) animBuckets.set(key, { geo: this.envGeometry(e.type), material, list: [], lights: [] });
+                const b = animBuckets.get(key);
+                const mesh = new THREE.Object3D();
+                mesh.userData.tube = true;
+                this.placeEnvPiece(mesh, e);
+                tubeThickness(mesh);
+                b.list.push(mesh);
+                b.lights.push({ e, mesh });
+                continue;
+            }
+            const material = e.material ? this.namedMaterial(e.material, e) : this.envMaterial(e.shader, e.color, e.glowing);
             if (e.track && e.track.length) {
                 // animated pieces: each keeps a transform its track can move,
                 // drawn together with every piece of the same shape + material
@@ -1761,13 +2021,7 @@ export class Gameplay {
                 const key = String(e.type) + '|' + material.uuid;
                 if (!animBuckets.has(key)) animBuckets.set(key, { geo: this.envGeometry(e.type), material, list: [] });
                 animBuckets.get(key).list.push(mesh);
-                this._envTransform(mesh, e, ENV_LOCAL_Z);
-                this.tracks.containerFor(e.track).add(mesh);
-                this.tracks.markEnv(e.track[0]);
-                mesh.userData.envBase = { pos: mesh.position.clone(), scale: mesh.scale.clone(), quat: mesh.quaternion.clone() };
-                mesh.userData.envTrack = e.track[0];
-                this.trackedEnvMeshes.push(mesh);
-                this.envMeshes.push(mesh);
+                this.placeEnvPiece(mesh, e);
             } else {
                 this._envTransform(helper, e, ENV_Z_ORIGIN);
                 helper.updateMatrix();
@@ -1777,7 +2031,25 @@ export class Gameplay {
             }
         }
 
-        for (const b of animBuckets.values()) this.envBatches.push(new EnvBatch(this.scene, b.geo, b.material, b.list));
+        this.envProxyRoot.updateMatrixWorld(true);          // fixed pieces never move
+        for (const b of animBuckets.values()) {
+            const batch = new EnvBatch(this.scene, b.geo, b.material, b.list, !!b.lights);
+            this.envBatches.push(batch);
+            if (!b.lights) continue;
+            b.lights.forEach(({ e, mesh }, i) => {
+                const transparent = b.material.transparent;
+                engine.customLights.add({
+                    type: e.light.type, id: e.light.id,
+                    apply: (st) => {
+                        // a track can animate the glow (AnimateComponent TubeBloomPrePassLight)
+                        const tv = mesh.userData.envTrack && this.tracks.tracks.get(mesh.userData.envTrack);
+                        const mul = tv && tv.values.colorAlphaMultiplier ? tv.values.colorAlphaMultiplier[0] : e.bloom;
+                        const k = st.level * LIGHT_OPTS.scale * clamp(0.6 + 0.3 * Math.sqrt(Math.max(0, mul)), 0.6, 1.8) * (transparent ? 0.55 : 1.2);
+                        batch.setColor(i, st.color.r * k, st.color.g * k, st.color.b * k);
+                    },
+                });
+            });
+        }
 
         for (const [material, geometries] of staticBuckets) {
             let merged = null;
@@ -1800,6 +2072,22 @@ export class Gameplay {
         }
     }
 
+    // a piece drawn instanced: on its track when it has one, else fixed
+    placeEnvPiece(mesh, e) {
+        if (e.track && e.track.length) {
+            this._envTransform(mesh, e, ENV_LOCAL_Z);
+            this.tracks.containerFor(e.track).add(mesh);
+            this.tracks.markEnv(e.track[0]);
+            mesh.userData.envBase = { pos: mesh.position.clone(), scale: mesh.scale.clone(), quat: mesh.quaternion.clone() };
+            mesh.userData.envTrack = e.track[0];
+            this.trackedEnvMeshes.push(mesh);
+        } else {
+            this._envTransform(mesh, e, ENV_Z_ORIGIN);
+            this.envProxyRoot.add(mesh);
+        }
+        this.envMeshes.push(mesh);
+    }
+
     // Chroma env track semantics: position/rotation/scale are absolute
     updateEnvPieces() {
         const s = this.tracks.absUnit;
@@ -1815,6 +2103,25 @@ export class Gameplay {
             else mesh.quaternion.copy(b.quat);
             if (v.scale) mesh.scale.set(v.scale[0] || 0.0001, v.scale[1] || 0.0001, v.scale[2] || 0.0001);
             else mesh.scale.copy(b.scale);
+            if (mesh.userData.tube) tubeThickness(mesh);
+        }
+        // directional lights a track turns
+        for (const d of this.envDirLights) {
+            const tr = d.track && this.tracks.tracks.get(d.track);
+            const v = tr && tr.values;
+            if (v && (v.localRotation || v.rotation)) d.holder.quaternion.copy(v.localRotation || v.rotation);
+            else d.holder.quaternion.copy(d.base);
+        }
+        // materials whose colour a track animates
+        for (const am of this.animMats) {
+            const tr = this.tracks.tracks.get(am.track);
+            const c = tr && tr.values.color;
+            if (c) {
+                am.mat.color.setRGB(clamp(c[0], 0, 4), clamp(c[1], 0, 4), clamp(c[2], 0, 4));
+                if (am.mat.emissive) am.mat.emissive.copy(am.mat.color);
+            } else {
+                am.mat.color.copy(am.base);
+            }
         }
     }
 
@@ -1914,10 +2221,28 @@ export class Gameplay {
         this.liveNotes.push(group);
     }
 
+    // Chroma bomb colours (one shared material per colour)
+    bombMaterial(chroma) {
+        const A = this.engine.assets;
+        if (!chroma) return A.bombMat;
+        const c = new THREE.Color();
+        tameColor(c, chroma);
+        const key = 'b' + c.getHexString();
+        let m = this._matCache.get(key);
+        if (!m) {
+            m = A.bombMat.clone();
+            m.color.copy(c);
+            if (m.emissive) m.emissive.copy(c).multiplyScalar(0.25);
+            this._matCache.set(key, m);
+        }
+        return m;
+    }
+
     spawnBomb(b) {
         const A = this.engine.assets;
         const own = this.needsOwnMaterial(b);
-        const mat = own ? this.ownMaterial(A.bombMat) : A.bombMat;
+        const base = this.bombMaterial(b.chroma);
+        const mat = own ? this.ownMaterial(base) : base;
         const mesh = new THREE.Mesh(A.bomb, mat);
         const animated = !!(b.anim || b.track);
         mesh.userData = {
@@ -2046,8 +2371,10 @@ export class Gameplay {
         }
 
         // Noodle: custom events, track animations, player movement
+        this.updateBases();
         this.tracks.update(t);
-        if (this.trackedEnvMeshes.length) this.updateEnvPieces();
+        if (this.rotations.length && !this.replay) this.updateYaw(t, dt);
+        if (this.trackedEnvMeshes.length || this.animMats.length || this.envDirLights.length) this.updateEnvPieces();
 
         // Chroma fog (AssignFogTrack / AnimateComponent BloomFogEnvironment)
         const fog = this.tracks.fogValues();
@@ -2073,6 +2400,55 @@ export class Gameplay {
             const mmss = (v) => Math.floor(v / 60) + ':' + String(Math.floor(v % 60)).padStart(2, '0');
             this.$('hud-time').textContent = `${mmss(sec)} / ${mmss(dur)}`;
         }
+    }
+
+    // lane rotation (degrees) in effect at time t
+    yawAt(t) {
+        const r = this.rotations;
+        let lo = 0, hi = r.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (r[mid].time <= t) lo = mid + 1; else hi = mid; }
+        return lo ? r[lo - 1].yaw : 0;
+    }
+
+    // turn smoothly toward the rotation of what's about to arrive (a controller
+    // player can't turn around in the room)
+    updateYaw(t, dt, snap = false) {
+        const target = this.yawAt(t + 0.6);
+        this.yaw = snap || dt > 0.5 ? target : this.yaw + (target - this.yaw) * (1 - Math.exp(-dt * 4));
+        const q = unityQuat(0, this.yaw, 0, _q);
+        if (this.tracks.playerTargets.Root) this.playerRig.quaternion.premultiply(q);
+        else this.playerRig.quaternion.copy(q);
+    }
+
+    // Heck "base" values point definitions can use (colours never change in a level)
+    setStaticBases() {
+        const c = (hex, a = 1) => { const col = new THREE.Color(hex); return [col.r, col.g, col.b, a]; };
+        const left = c(settings.get('leftColor')), right = c(settings.get('rightColor'));
+        Object.assign(BASES, {
+            baseNote0Color: left, baseNote1Color: right, baseSaberAColor: left, baseSaberBColor: right,
+            baseObstaclesColor: c(0xff2d55),
+            baseEnvironmentColor0: c(BASE_RED), baseEnvironmentColor1: c(BASE_BLUE), baseEnvironmentColorW: c(BASE_WHITE),
+            baseEnvironmentColor0Boost: c(BASE_RED), baseEnvironmentColor1Boost: c(BASE_BLUE), baseEnvironmentColorWBoost: c(BASE_WHITE),
+        });
+    }
+
+    // head and saber transforms, in Beat Saber's terms (metres from the player, +z forward)
+    updateBases() {
+        const put = (prefix, obj) => {
+            obj.updateWorldMatrix(true, false);
+            obj.matrixWorld.decompose(_v, _q2, _v2);
+            const pos = BASES[prefix + 'Position'] || (BASES[prefix + 'Position'] = [0, 0, 0]);
+            pos[0] = _v.x; pos[1] = _v.y; pos[2] = -(_v.z - HIT_Z);
+            _eul.setFromQuaternion(_q2, 'YXZ');
+            const rot = BASES[prefix + 'Rotation'] || (BASES[prefix + 'Rotation'] = [0, 0, 0]);
+            rot[0] = -_eul.x / DEG; rot[1] = -_eul.y / DEG; rot[2] = _eul.z / DEG;
+            BASES[prefix + 'LocalPosition'] = pos;
+            BASES[prefix + 'LocalRotation'] = rot;
+            BASES[prefix + 'LocalScale'] = [1, 1, 1];
+        };
+        put('baseHead', this.engine.camera);
+        put('baseLeftHand', this.saberLeft.group);
+        put('baseRightHand', this.saberRight.group);
     }
 
     // Apply combined Noodle effects (object anim + track paths + track values)
@@ -2146,7 +2522,14 @@ export class Gameplay {
                     : -(n.time - t) * ud.speed;
                 const rise = n.noGravity ? 1 : clamp(p / 0.4, 0, 1);
                 const easedRise = 1 - Math.pow(1 - rise, 3);
-                g.position.set(ud.x, THREE.MathUtils.lerp(ud.targetY - SPAWN_LEAD_Y, ud.targetY, easedRise), z);
+                let x = ud.x, y = THREE.MathUtils.lerp(ud.targetY - SPAWN_LEAD_Y, ud.targetY, easedRise);
+                if (n.flip) {
+                    // Noodle flip: starts in another lane and hops across into its own
+                    const f = clamp(p / 0.4, 0, 1), ef = 1 - Math.pow(1 - f, 3);
+                    x = THREE.MathUtils.lerp(colX(n.flip[0]), ud.x, ef);
+                    y += Math.sin(Math.PI * ef) * n.flip[1] * 0.3;
+                }
+                g.position.set(x, y, z);
                 g.quaternion.copy(ud.restQuat);
                 if (easedRise < 1) g.quaternion.multiply(_q.setFromAxisAngle(AXIS_Z, (1 - easedRise) * 0.8));
                 g.scale.setScalar((0.5 + easedRise * 0.5) * ud.size);
@@ -2183,6 +2566,12 @@ export class Gameplay {
             const zt = ud.zt;
             const lifeOver = (t - n.time) / ud.rt;   // >1 = well past despawn
 
+            if (ud.linkCut) {                       // a note linked to one just cut goes with it
+                if (ud.decorative) { this.cutEffects(g, ud.linkCut.vel); this.removeObj(g); this.liveNotes.splice(i, 1); }
+                else if (ud.linkCut.bad) this.badCut(g, i);
+                else this.hitNote(g, i, ud.linkCut);
+                continue;
+            }
             if (ud.decorative) {                     // scenery: never hit, never punish
                 if (lifeOver > 2.5 || (lifeOver > 1.2 && zt > 2)) {
                     this.removeObj(g); this.liveNotes.splice(i, 1);
@@ -2198,14 +2587,19 @@ export class Gameplay {
             const z0 = ud.prevZt == null ? zt : ud.prevZt;
             if (ud.prevZt == null) ud.prevWp.copy(ud.wp);
             if (!uninteractableNow && zt > -1.0 && z0 < 1.0) {
-                const saber = n.color === 0 ? this.saberLeft : this.saberRight;
+                let saber = n.color === 0 ? this.saberLeft : this.saberRight;
                 const wrongSaber = n.color === 0 ? this.saberRight : this.saberLeft;
+                // Noodle disableBadCutSaberType: either saber cuts it
+                const sabers = n.noBadSaber ? [saber, wrongSaber] : [saber];
                 let best = Infinity;
-                for (let k = 0; k <= 4; k++) {
-                    const f = k / 4, z = z0 + (zt - z0) * f;
-                    if (z <= -1.0 || z >= 1.0) continue;
-                    _v.lerpVectors(ud.prevWp, ud.wp, f);
-                    best = Math.min(best, saber.distanceAt(_v, f));
+                for (const sb of sabers) {
+                    for (let k = 0; k <= 4; k++) {
+                        const f = k / 4, z = z0 + (zt - z0) * f;
+                        if (z <= -1.0 || z >= 1.0) continue;
+                        _v.lerpVectors(ud.prevWp, ud.wp, f);
+                        const d = sb.distanceAt(_v, f);
+                        if (d < best) { best = d; saber = sb; }
+                    }
                 }
                 if (best < 0.6) {
                     // judge at the best moment of the contact, not the first touch:
@@ -2219,7 +2613,7 @@ export class Gameplay {
                 }
                 if (ud.contact) { this.hitNote(g, i, ud.contact); continue; }      // blade has left the note
                 // wrong saber only counts against you on a deliberate fast swing
-                if (wrongSaber.distanceTo(ud.wp) < 0.22 && wrongSaber.smoothVel.length() > 1.6) {
+                if (!n.noBadSaber && wrongSaber.distanceTo(ud.wp) < 0.22 && wrongSaber.smoothVel.length() > 1.6) {
                     this.badCut(g, i);
                     continue;
                 }
@@ -2272,7 +2666,7 @@ export class Gameplay {
         _swing.normalize();
         const color = ud.mat.color;
         // replays have their own switches (Replay options), normal play uses Look
-        const halves = this.replay ? this.ro.halves : this.vis.halves;
+        const halves = (this.replay ? this.ro.halves : this.vis.halves) && !(ud.note && ud.note.noDebris);
         if (halves) this.engine.slices.spawn(ud.wp, _swing, color);
         const n = Math.round(18 * this.sparkScale());
         if (n) this.engine.particles.burst(ud.wp, color, n);
@@ -2285,10 +2679,10 @@ export class Gameplay {
         const speed = vel.length();
         const dv = ud.swing;
         const dot = speed > 0.3 ? (vel.x * dv[0] + vel.y * dv[1]) / speed : 0;
-        const dirOk = n.dir === 8 || n.chainLink || !!this.mods.noArrows || dot > 0.45;
+        const dirOk = n.dir === 8 || n.chainLink || !!this.mods.noArrows || n.noBadDirection || dot > 0.45;
         let judgement = 'OK', points = 80;
         if (dirOk && speed > 1.1) { judgement = 'PERFECT'; points = 115; }
-        else if (speed > 0.35) { judgement = 'GOOD'; points = 100; }
+        else if (speed > 0.35 || n.noBadSpeed) { judgement = 'GOOD'; points = 100; }
         // Strict Angles: only a cut along the arrow counts
         if (this.mods.strict && !dirOk) points = 0;
         return { judgement, points, dirOk, vel: vel.clone() };
@@ -2319,7 +2713,17 @@ export class Gameplay {
         this.cutEffects(g, vel);
         this.removeObj(g);
         this.liveNotes.splice(idx, 1);
+        this.cutLinked(n, cut);
         this.updateHud(true);
+    }
+
+    // Noodle link: cutting a note cuts every note sharing its link
+    cutLinked(n, cut) {
+        if (!n.link) return;
+        for (const g of this.liveNotes) {
+            const ud = g.userData;
+            if (ud.note.link === n.link && !ud.linkCut) ud.linkCut = cut;
+        }
     }
 
     badCut(g, idx, label = 'WRONG SABER') {
@@ -2332,8 +2736,10 @@ export class Gameplay {
         this.addEnergy(this.mods.instantFail ? -2 : -0.05);
         this.playMissSound(0.6);
         this.showJudgement(label, '#ff5a5a');
+        const n = g.userData.note;
         this.removeObj(g);
         this.liveNotes.splice(idx, 1);
+        this.cutLinked(n, { bad: true, vel: new THREE.Vector2(0, -1) });
         this.updateHud();
     }
 
@@ -2701,6 +3107,7 @@ export class Gameplay {
         while (this.eventIdx < evs.length && evs[this.eventIdx].time <= target) this.engine.handleEvent(evs[this.eventIdx++]);
         this.tracks.reset();
         this.tracks.update(target);
+        if (this.rotations.length && !this.replay) this.updateYaw(target, 0, true);
 
         // respawn what is on screen at the target (spawned, not yet resolved or gone)
         const respawn = (queue, spawn, alive) => {
@@ -2768,10 +3175,12 @@ export class Gameplay {
     applyControlSettings() {
         const S = settings;
         const spread = S.num('saberRestSpread', 0, 1);
+        // wider maps (Mapping Extensions extra lanes/layers) get the extra reach they need
+        const over = this._overflow || (this._overflow = this.gridOverflow());
         const base = {
             restY: S.num('saberRestHeight', 0.6, 2.2),
-            reachX: S.num('saberReachX', 0.4, 2.5),
-            reachY: S.num('saberReachY', 0.3, 1.6),
+            reachX: S.num('saberReachX', 0.4, 2.5) + over.x,
+            reachY: S.num('saberReachY', 0.3, 1.6) + over.y,
             smooth: S.num('saberSmoothing', 0, 0.12),
             tilt: S.num('saberTilt', 0, 75) * DEG,
         };
@@ -3110,6 +3519,11 @@ export class Gameplay {
         for (const m of (this.envMeshes || [])) m.removeFromParent();
         for (const b of (this.envBatches || [])) b.dispose();
         this.envBatches = [];
+        if (this.envProxyRoot) this.envProxyRoot.removeFromParent();
+        for (const d of (this.envDirLights || [])) { d.holder.removeFromParent(); d.light.dispose(); }
+        this.envDirLights = [];
+        this.animMats = [];
+        this.engine.customLights = null;
         this.wallBatches.fancy.dispose();
         this.wallBatches.plain.dispose();
         for (const g of (this.envGeos || [])) g.dispose();
