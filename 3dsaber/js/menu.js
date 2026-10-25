@@ -6,7 +6,7 @@ import {
     CAMERA_KEYS, CONTROL_KEYS, MOD_KEYS, PLAY_KEYS, VISUAL_KEYS, ALL_KEYS, LOOK_KEYS,
 } from './settings.js';
 import {
-    searchMaps, downloadMap, getSavedMaps, getSavedMap, deleteSavedMap,
+    searchMaps, downloadMap, getSavedMaps, getSavedMap, deleteSavedMap, loadFullMap,
     getSavedIds, findSavedByHash, getMapByHash, mapAvailable, isDownloadableHash,
 } from './beatsaver.js';
 import { parseDifficulty } from './beatmap.js';
@@ -467,6 +467,8 @@ export class Menu {
                 bpm = BUILTIN_SONG.bpm;
                 mapId = BUILTIN_SONG.id;
             } else {
+                // lists only hold map summaries: fetch this map's song and difficulty files
+                record = await loadFullMap(record);
                 songBuffer = await this.decodeSong(record);
                 const raw = record.diffFiles[diff.filename];
                 if (!raw) throw new Error('Difficulty file missing from download');

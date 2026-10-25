@@ -63,8 +63,8 @@ function ease(name, x) {
     return fn ? fn(x) : x;
 }
 
-// Maps use stray strings/nulls in point data (e.g. Heck "base" properties we
-// don't model). Treat anything non-numeric as 0 so nothing turns into NaN.
+// Maps use stray strings/nulls in point data. Treat anything non-numeric as 0
+// so nothing turns into NaN.
 function n0(v) {
     return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
@@ -74,37 +74,117 @@ export const PROP_DIMS = {
     rotation: 3, localRotation: 3,
     scale: 3, dissolve: 1, dissolveArrow: 1, color: 4, interactable: 1, time: 1,
     attenuation: 1, fogOffset: 1, startY: 1, height: 1,
+    colorAlphaMultiplier: 1, bloomFogIntensityMultiplier: 1,
 };
 const ROT_PROPS = { rotation: true, localRotation: true };
 
-// ---------- Point sampler ----------
-const isKeyframed = (points) => Array.isArray(points) && points.length > 0 && Array.isArray(points[0]);
-const timeOf = (p, dims) => n0(p[dims]);
+// ---------- Base properties ----------
+// Point values can name a live value instead of numbers ("baseHeadPosition",
+// "baseNote0Color", ...). The game keeps these current every frame.
+export const BASES = {};
+function readBase(name, out, dims) {
+    const b = BASES[name];
+    for (let d = 0; d < dims; d++) out[d] = b ? n0(b[d] ?? (d === 3 ? 1 : 0)) : (d === 3 ? 1 : 0);
+}
+
+// ---------- Point definitions ----------
+// Compiled once per raw array (and property size):
+//   [{v: number[] | null, base: string | null, mods, t, easing, spline, hsv}]
+// A point is [values..., time, flags...] where values may be a base name and
+// trailing arrays are modifiers: [values | base, "opAdd"/"opSub"/"opMul"/"opDiv"/"opNone", nested...].
+// A single point may be given without the outer list (time 0).
+const compiledCache = new WeakMap();
+
+function parseModifier(raw) {
+    const nums = [], mods = [];
+    let base = null, op = 'opNone';
+    for (const x of raw) {
+        if (Array.isArray(x)) mods.push(parseModifier(x));
+        else if (typeof x === 'string') { if (x.startsWith('op')) op = x; else if (x.startsWith('base')) base = x; }
+        else nums.push(n0(x));
+    }
+    return { v: nums, base, op, mods, buf: [] };
+}
+
+function parsePoint(raw, dims, timed) {
+    const nums = [], mods = [];
+    let base = null, easing = null, spline = false, hsv = false;
+    for (const x of raw) {
+        if (Array.isArray(x)) mods.push(parseModifier(x));
+        else if (typeof x === 'string') {
+            if (x.startsWith('ease')) easing = x;
+            else if (x === 'splineCatmullRom') spline = true;
+            else if (x === 'lerpHSV') hsv = true;
+            else if (x.startsWith('base')) base = x;
+        } else nums.push(n0(x));
+    }
+    let t = 0, v = null;
+    if (base) {
+        if (timed && nums.length) t = nums[nums.length - 1];
+    } else {
+        v = nums.slice(0, dims);
+        while (v.length < dims) v.push(dims === 4 && v.length === 3 ? 1 : 0);
+        if (timed && nums.length > dims) t = nums[dims];
+    }
+    return { v, base, mods, t, easing, spline, hsv };
+}
+
+function compile(points, dims) {
+    let byDims = compiledCache.get(points);
+    if (byDims && byDims[dims]) return byDims[dims];
+    let list;
+    if (Array.isArray(points[0])) list = points.filter(Array.isArray).map(p => parsePoint(p, dims, true));
+    else list = [parsePoint(points, dims, false)];
+    // keyframes must be in time order for the binary search
+    for (let i = 1; i < list.length; i++) if (list[i].t < list[i - 1].t) { list.sort((a, b) => a.t - b.t); break; }
+    if (!byDims) { byDims = {}; compiledCache.set(points, byDims); }
+    byDims[dims] = list;
+    return list;
+}
+
+function applyOp(op, out, m, dims) {
+    for (let d = 0; d < dims; d++) {
+        const b = m.length === 1 ? m[0] : (m[d] ?? (op === 'opMul' || op === 'opDiv' ? 1 : 0));
+        switch (op) {
+            case 'opAdd': out[d] += b; break;
+            case 'opSub': out[d] -= b; break;
+            case 'opMul': out[d] *= b; break;
+            case 'opDiv': out[d] = b ? out[d] / b : 0; break;
+            default: out[d] = b;
+        }
+    }
+}
+
+function modValue(m, dims) {
+    const buf = m.buf;
+    if (m.base) readBase(m.base, buf, dims);
+    else { for (let d = 0; d < m.v.length; d++) buf[d] = m.v[d]; buf.length = m.v.length || 1; if (!m.v.length) buf[0] = 0; }
+    for (const sub of m.mods) applyOp(sub.op, buf, modValue(sub, buf.length), buf.length);
+    return buf;
+}
+
+// a point's value right now (bases are live, modifiers applied)
+function pointValue(p, dims, out) {
+    if (p.base) readBase(p.base, out, dims);
+    else for (let d = 0; d < dims; d++) out[d] = p.v[d];
+    for (const m of p.mods) applyOp(m.op, out, modValue(m, dims), dims);
+    out.length = dims;
+    return out;
+}
 
 // Index of the last keyframe whose time <= t (binary search — some wall-art
 // maps have thousands of points)
-function findSegment(pts, t, dims) {
-    let lo = 0, hi = pts.length - 1;
+function findSegment(list, t) {
+    let lo = 0, hi = list.length - 1;
     while (lo < hi) {
         const mid = (lo + hi + 1) >> 1;
-        if (timeOf(pts[mid], dims) <= t) lo = mid; else hi = mid - 1;
+        if (list[mid].t <= t) lo = mid; else hi = mid - 1;
     }
     return lo;
 }
 
-function segmentFlags(b, dims) {
-    let easing = null, spline = false, hsv = false;
-    for (let k = dims + 1; k < b.length; k++) {
-        const f = b[k];
-        if (typeof f !== 'string') continue;
-        if (f.startsWith('ease')) easing = f;
-        else if (f === 'splineCatmullRom') spline = true;
-        else if (f === 'lerpHSV') hsv = true;
-    }
-    return { easing, spline, hsv };
-}
-
 const _hsvA = {}, _hsvB = {}, _colA = new THREE.Color(), _colB = new THREE.Color();
+const _pa = [], _pb = [], _p0 = [], _p3 = [];
 
 // points: number | [v...] (static) | [[v..., time, ...flags], ...]
 // Writes into `out` (an array) and returns it, or null when there is nothing.
@@ -112,53 +192,36 @@ export function samplePts(points, t, dims, out = []) {
     if (points == null) return null;
     if (typeof points === 'number') { out[0] = n0(points); out.length = 1; return out; }
     if (!Array.isArray(points) || !points.length) return null;
-    if (!isKeyframed(points)) {
-        for (let d = 0; d < dims; d++) out[d] = n0(points[d]);
-        out.length = dims;
-        return out;
-    }
+    const list = compile(points, dims);
+    if (!list.length) return null;
+    if (list.length === 1 || t <= list[0].t) return pointValue(list[0], dims, out);
+    const last = list[list.length - 1];
+    if (t >= last.t) return pointValue(last, dims, out);
 
-    const pts = points;
-    const first = pts[0], last = pts[pts.length - 1];
-    let i;
-    if (t <= timeOf(first, dims)) { i = -1; }
-    else if (t >= timeOf(last, dims)) { i = pts.length - 1; }
-    else { i = findSegment(pts, t, dims); }
+    const i = findSegment(list, t);
+    const a = list[i], b = list[i + 1];
+    let f = b.t > a.t ? (t - a.t) / (b.t - a.t) : 1;
+    f = ease(b.easing, f);                    // flags live on the segment's end point
+    const va = pointValue(a, dims, _pa), vb = pointValue(b, dims, _pb);
 
-    if (i < 0 || i >= pts.length - 1) {
-        const p = i < 0 ? first : last;
-        for (let d = 0; d < dims; d++) out[d] = n0(p[d]);
-        out.length = dims;
-        return out;
-    }
-
-    const a = pts[i], b = pts[i + 1];
-    const ta = timeOf(a, dims), tb = timeOf(b, dims);
-    let f = tb > ta ? (t - ta) / (tb - ta) : 1;
-    const flags = segmentFlags(b, dims);      // flags live on the segment's end point
-    f = ease(flags.easing, f);
-
-    if (flags.spline && dims >= 3) {
-        const p0 = pts[Math.max(0, i - 1)], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    if (b.spline && dims >= 3) {
+        const v0 = pointValue(list[Math.max(0, i - 1)], dims, _p0), v3 = pointValue(list[Math.min(list.length - 1, i + 2)], dims, _p3);
         for (let d = 0; d < dims; d++) {
-            const v0 = n0(p0[d]), v1 = n0(a[d]), v2 = n0(b[d]), v3 = n0(p3[d]);
-            out[d] = 0.5 * ((2 * v1) + (-v0 + v2) * f +
-                (2 * v0 - 5 * v1 + 4 * v2 - v3) * f * f +
-                (-v0 + 3 * v1 - 3 * v2 + v3) * f * f * f);
+            const p0 = v0[d], p1 = va[d], p2 = vb[d], p3 = v3[d];
+            out[d] = 0.5 * ((2 * p1) + (-p0 + p2) * f +
+                (2 * p0 - 5 * p1 + 4 * p2 - p3) * f * f +
+                (-p0 + 3 * p1 - 3 * p2 + p3) * f * f * f);
         }
-    } else if (flags.hsv && dims === 4) {
-        _colA.setRGB(n0(a[0]), n0(a[1]), n0(a[2])).getHSL(_hsvA);
-        _colB.setRGB(n0(b[0]), n0(b[1]), n0(b[2])).getHSL(_hsvB);
+    } else if (b.hsv && dims === 4) {
+        _colA.setRGB(va[0], va[1], va[2]).getHSL(_hsvA);
+        _colB.setRGB(vb[0], vb[1], vb[2]).getHSL(_hsvB);
         let dh = _hsvB.h - _hsvA.h;
         if (dh > 0.5) dh -= 1; else if (dh < -0.5) dh += 1;
         _colA.setHSL((_hsvA.h + dh * f + 1) % 1, _hsvA.s + (_hsvB.s - _hsvA.s) * f, _hsvA.l + (_hsvB.l - _hsvA.l) * f);
         out[0] = _colA.r; out[1] = _colA.g; out[2] = _colA.b;
-        out[3] = n0(a[3] ?? 1) + (n0(b[3] ?? 1) - n0(a[3] ?? 1)) * f;
+        out[3] = va[3] + (vb[3] - va[3]) * f;
     } else {
-        for (let d = 0; d < dims; d++) {
-            const va = n0(a[d]);
-            out[d] = va + (n0(b[d]) - va) * f;
-        }
+        for (let d = 0; d < dims; d++) out[d] = va[d] + (vb[d] - va[d]) * f;
     }
     out.length = dims;
     return out;
@@ -179,23 +242,23 @@ export function setUnityRotation(target, rx, ry, rz) {
 }
 
 const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion();
+const _ra = [], _rb = [];
 // Heck interpolates rotation keyframes with quaternion slerp (so [0,0,0] →
 // [0,360,0] is *no* rotation, exactly like in game).
 export function sampleRot(points, t, out = new THREE.Quaternion()) {
     if (points == null || !Array.isArray(points) || !points.length) return null;
-    if (!isKeyframed(points)) return unityQuat(points[0], points[1], points[2], out);
-    const pts = points;
-    const first = pts[0], last = pts[pts.length - 1];
-    if (t <= timeOf(first, 3)) return unityQuat(first[0], first[1], first[2], out);
-    if (t >= timeOf(last, 3)) return unityQuat(last[0], last[1], last[2], out);
-    const i = findSegment(pts, t, 3);
-    if (i >= pts.length - 1) return unityQuat(last[0], last[1], last[2], out);
-    const a = pts[i], b = pts[i + 1];
-    const ta = timeOf(a, 3), tb = timeOf(b, 3);
-    let f = tb > ta ? (t - ta) / (tb - ta) : 1;
-    f = ease(segmentFlags(b, 3).easing, f);
-    unityQuat(a[0], a[1], a[2], _qa);
-    unityQuat(b[0], b[1], b[2], _qb);
+    const list = compile(points, 3);
+    if (!list.length) return null;
+    const last = list[list.length - 1];
+    if (list.length === 1 || t <= list[0].t) { const v = pointValue(list[0], 3, _ra); return unityQuat(v[0], v[1], v[2], out); }
+    if (t >= last.t) { const v = pointValue(last, 3, _ra); return unityQuat(v[0], v[1], v[2], out); }
+    const i = findSegment(list, t);
+    const a = list[i], b = list[i + 1];
+    let f = b.t > a.t ? (t - a.t) / (b.t - a.t) : 1;
+    f = ease(b.easing, f);
+    const va = pointValue(a, 3, _ra), vb = pointValue(b, 3, _rb);
+    unityQuat(va[0], va[1], va[2], _qa);
+    unityQuat(vb[0], vb[1], vb[2], _qb);
     return out.slerpQuaternions(_qa, _qb, f);
 }
 
@@ -365,13 +428,27 @@ export class TrackSystem {
         } else if (ev.type === 'AssignTrackParent') {
             const parent = this.track(ev.parent);
             if (parent.kind === KIND.OBJECT) parent.kind = KIND.PARENT;
+            // the parent object starts out where its track already says
+            if (parent.kind === KIND.PARENT) setAbsolute(parent.group, parent.values, this.absUnit);
             for (const child of (ev.children || [])) {
                 const c = this.track(child);
                 if (c === parent) continue;
                 // never create a cycle (it would recurse forever in updateMatrixWorld)
                 let p = parent.group, cyclic = false;
-                while (p) { if (p === c.group) { cyclic = true; break; } p = p.parent; }
-                if (!cyclic) parent.group.add(c.group);
+                while (p) { if (p === c.group || p === c.stay) { cyclic = true; break; } p = p.parent; }
+                if (cyclic) continue;
+                if (ev.worldPositionStays) {
+                    // the child keeps its place in the world: an in-between group
+                    // undoes where the parent is right now
+                    const oldParent = c.group.parent || this.root;
+                    relMatrix(parent.group, this.root, _m1).invert().multiply(relMatrix(oldParent, this.root, _m2));
+                    const stay = c.stay || (c.stay = new THREE.Group());
+                    _m1.decompose(stay.position, stay.quaternion, stay.scale);
+                    parent.group.add(stay);
+                    stay.add(c.group);
+                } else {
+                    parent.group.add(c.group);
+                }
             }
         } else if (ev.type === 'AssignPlayerToTrack') {
             const name = ev.tracks[0] || null;
@@ -407,7 +484,9 @@ export class TrackSystem {
         // transforms (position/rotation/localRotation/scale).
         for (const tr of this.tracks.values()) {
             const v = tr.values, g = tr.group;
-            if (tr.kind === KIND.OBJECT) {
+            if (tr.kind === KIND.PLAYER) {
+                setAbsolute(g, v, this.absUnit);
+            } else if (tr.kind === KIND.OBJECT) {
                 const op = v.offsetPosition, p2 = this.v2 ? v.position : null;
                 g.position.set(
                     ((op ? op[0] : 0) + (p2 ? p2[0] : 0)) * UNIT,
@@ -415,36 +494,20 @@ export class TrackSystem {
                     -((op ? op[2] : 0) + (p2 ? p2[2] : 0)) * UNIT);
                 if (v.rotation) g.quaternion.copy(v.rotation); else g.quaternion.identity();
             } else if (tr.kind === KIND.PARENT) {
-                const s = this.absUnit;
-                const p = v.localPosition || v.position;
-                const op = v.offsetPosition;
-                g.position.set(
-                    (p ? p[0] * s : 0) + (op ? op[0] * UNIT : 0),
-                    (p ? p[1] * s : 0) + (op ? op[1] * UNIT : 0),
-                    -((p ? p[2] * s : 0) + (op ? op[2] * UNIT : 0)));
-                g.quaternion.identity();
-                if (v.rotation) g.quaternion.copy(v.rotation);
-                if (v.localRotation) g.quaternion.multiply(v.localRotation);
-                if (v.scale) g.scale.set(v.scale[0], v.scale[1], v.scale[2]); else g.scale.set(1, 1, 1);
+                setAbsolute(g, v, this.absUnit);
             }
             // ENV tracks: pieces are positioned individually by the game
         }
 
-        // player / head / saber movement (AssignPlayerToTrack targets)
+        // player / head / saber movement (AssignPlayerToTrack targets): the
+        // track's transform, parents included
         for (const target in this.playerTargets) {
             const rig = this.rigs[target];
             if (!rig) continue;
             const base = this.rigBase[target];
-            const v = this.track(this.playerTargets[target]).values;
-            const s = this.absUnit;
-            const p = v.localPosition || v.position;
-            const op = v.offsetPosition;
-            rig.position.copy(base.pos);
-            if (p) rig.position.add(_v3.set(p[0] * s, p[1] * s, -p[2] * s));
-            if (op) rig.position.add(_v3.set(op[0] * UNIT, op[1] * UNIT, -op[2] * UNIT));
-            rig.quaternion.copy(base.quat);
-            if (v.rotation) rig.quaternion.multiply(v.rotation);
-            if (v.localRotation) rig.quaternion.multiply(v.localRotation);
+            relMatrix(this.track(this.playerTargets[target]).group, this.root, _m1).decompose(_v3, _q1, _s1);
+            rig.position.copy(base.pos).add(_v3);
+            rig.quaternion.copy(base.quat).multiply(_q1);
         }
     }
 
@@ -588,4 +651,30 @@ export class TrackSystem {
     }
 }
 
-const _v3 = new THREE.Vector3();
+const _v3 = new THREE.Vector3(), _s1 = new THREE.Vector3(), _q1 = new THREE.Quaternion();
+const _m1 = new THREE.Matrix4(), _m2 = new THREE.Matrix4();
+
+// Parent / player tracks are real transforms: position/localPosition are
+// absolute, offsetPosition is in lanes, rotations multiply
+function setAbsolute(g, v, s) {
+    const p = v.localPosition || v.position;
+    const op = v.offsetPosition;
+    g.position.set(
+        (p ? p[0] * s : 0) + (op ? op[0] * UNIT : 0),
+        (p ? p[1] * s : 0) + (op ? op[1] * UNIT : 0),
+        -((p ? p[2] * s : 0) + (op ? op[2] * UNIT : 0)));
+    g.quaternion.identity();
+    if (v.rotation) g.quaternion.copy(v.rotation);
+    if (v.localRotation) g.quaternion.multiply(v.localRotation);
+    if (v.scale) g.scale.set(v.scale[0], v.scale[1], v.scale[2]); else g.scale.set(1, 1, 1);
+}
+
+// transform of `obj` relative to `root` (one of its ancestors)
+function relMatrix(obj, root, out) {
+    out.identity();
+    for (let g = obj; g && g !== root; g = g.parent) {
+        g.updateMatrix();
+        out.premultiply(g.matrix);
+    }
+    return out;
+}
