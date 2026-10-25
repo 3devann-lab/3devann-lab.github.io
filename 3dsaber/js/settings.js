@@ -14,6 +14,7 @@ const DEFAULTS = {
     cursorSpeed: 1.0,
     quality: 'auto',      // auto (dynamic resolution) / high / medium / low
     safeMode: true,       // drop to light graphics if a map overloads the GPU
+    memorySaver: 'auto',  // stream songs + small render buffers: auto (consoles, low-memory devices) / on / off
     blProxy: '',          // BeatLeader API proxy: '' = built-in worker, a URL, or 'off' (see proxy/README.md)
     trailLength: 0.12,    // saber trail length in seconds (0 = off)
 

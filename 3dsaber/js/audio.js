@@ -1,4 +1,5 @@
 // ============ Audio engine: song playback with sample-accurate clock + SFX ============
+import { lowMemory, rememberLowMemory } from './device.js';
 
 // What kind of audio file is this? (from its first bytes)
 export function sniffAudio(ab) {
@@ -143,26 +144,37 @@ class AudioEngine {
      *    lower sample rate (about a third less memory),
      * 3. if that fails too, stream it through an <audio> element (almost no
      *    memory; the clock follows the element).
+     * preferStream (consoles / low-memory devices) streams first: a decoded
+     * song is 50–250 MB, a streamed one a few.
      * Returns an AudioBuffer or a streamed song ({isMedia, duration, ...}).
      */
-    async decode(arrayBuffer, { allowStream = true } = {}) {
+    async decode(arrayBuffer, { allowStream = true, preferStream = false } = {}) {
         this.init();
         const fmt = sniffAudio(arrayBuffer);
         if (fmt.kind === 'empty' || fmt.kind === 'web page') {
             throw new Error(`the song file is ${fmt.kind === 'empty' ? 'empty' : 'not audio (a web page)'} — try deleting and re-downloading the map`);
         }
         const errors = [];
+        let triedStream = false;
+        if (preferStream && allowStream) {
+            triedStream = true;
+            try { return await this.streamSong(arrayBuffer, fmt.mime); } catch (e) { errors.push(e); }
+        }
         // A long song decoded at full rate is 150–250 MB, enough to crash a tab
         // on a device short on memory: decode those at 32 kHz straight away
         // (a third less memory, no audible difference in a game)
-        const lowMem = arrayBuffer.byteLength > 12e6 || (navigator.deviceMemory && navigator.deviceMemory <= 4);
+        const lowMem = preferStream || lowMemory() || arrayBuffer.byteLength > 12e6 || (navigator.deviceMemory && navigator.deviceMemory <= 4);
         const at32k = async () => new OfflineAudioContext(2, 1, 32000).decodeAudioData(arrayBuffer.slice(0));
         if (lowMem) { try { return await at32k(); } catch (e) { errors.push(e); } }
         // decodeAudioData detaches the buffer — pass a copy so callers keep theirs
-        try { return await this.ctx.decodeAudioData(arrayBuffer.slice(0)); } catch (e) { errors.push(e); }
+        if (!lowMemory()) { try { return await this.ctx.decodeAudioData(arrayBuffer.slice(0)); } catch (e) { errors.push(e); } }
         if (!lowMem) { try { return await at32k(); } catch (e) { errors.push(e); } }
-        if (allowStream) {
-            try { return await this.streamSong(arrayBuffer, fmt.mime); } catch (e) { errors.push(e); }
+        if (allowStream && !triedStream) {
+            try {
+                const s = await this.streamSong(arrayBuffer, fmt.mime);
+                rememberLowMemory();             // decoding ran out of room: stream right away next time
+                return s;
+            } catch (e) { errors.push(e); }
         }
         console.error('Song decode failed', fmt.kind, errors);
         const hint = fmt.kind === 'Ogg'

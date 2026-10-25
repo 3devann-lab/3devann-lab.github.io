@@ -12,6 +12,7 @@ import { audio } from './audio.js';
 import { gamepad, shapeStick } from './input.js';
 import { settings } from './settings.js';
 import { buildSaber } from './looks.js';
+import { lowMemory } from './device.js';
 
 // ---------- World constants ----------
 // Notes arrive on the beat at HIT_Z. Everything Beat Saber places relative to
@@ -683,8 +684,10 @@ export class Engine {
         const q = settings.get('quality') || 'auto';
         this.qualityName = QUALITY[q] ? q : 'auto';
         this.q = QUALITY[this.qualityName];
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        this.maxScale = Math.min(dpr, this.q.maxScale);
+        // consoles (Xbox) and low-memory devices: no MSAA and at most one pixel per
+        // CSS pixel — the post-processing buffers are the renderer's biggest cost
+        this.lowMem = lowMemory();
+        this.maxScale = this.scaleCap();
         this.minScale = 0.5;
         this.renderScale = this.maxScale;
         this.renderer.setPixelRatio(this.renderScale);
@@ -693,7 +696,7 @@ export class Engine {
         const dbs = this.renderer.getDrawingBufferSize(new THREE.Vector2());
         const rt = new THREE.WebGLRenderTarget(dbs.x, dbs.y, {
             type: THREE.HalfFloatType,
-            samples: this.renderer.capabilities.isWebGL2 ? this.q.msaa : 0,
+            samples: this.msaaSamples(),
         });
         this.composer = new EffectComposer(this.renderer, rt);
         this.renderPass = new RenderPass(this.scene, this.camera);
@@ -836,21 +839,30 @@ export class Engine {
         this.composer.setSize(innerWidth, innerHeight);
         const dbs = this.renderer.getDrawingBufferSize(new THREE.Vector2());
         this.resolution.copy(dbs);
-        const rd = this.q.refrDiv;
+        const rd = this.lowMem ? Math.max(4, this.q.refrDiv) : this.q.refrDiv;
         this.refractionRT.setSize(Math.max(2, Math.floor(dbs.x / rd)), Math.max(2, Math.floor(dbs.y / rd)));
-        if (this.q.bloomDiv > 1) this.bloom.setSize(Math.floor(dbs.x / this.q.bloomDiv), Math.floor(dbs.y / this.q.bloomDiv));
+        const bd = this.lowMem ? Math.max(2, this.q.bloomDiv) : this.q.bloomDiv;
+        if (bd > 1) this.bloom.setSize(Math.floor(dbs.x / bd), Math.floor(dbs.y / bd));
+    }
+
+    scaleCap() {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        return Math.min(dpr, this.q.maxScale, this.lowMem ? 1 : 2);
+    }
+
+    msaaSamples() {
+        return this.renderer.capabilities.isWebGL2 && !this.lowMem ? this.q.msaa : 0;
     }
 
     setQuality(name) {
         if (!QUALITY[name]) return;
         this.qualityName = name;
         this.q = QUALITY[name];
-        const samples = this.renderer.capabilities.isWebGL2 ? this.q.msaa : 0;
+        const samples = this.msaaSamples();
         for (const rt of [this.composer.renderTarget1, this.composer.renderTarget2]) {
             if (rt.samples !== samples) { rt.samples = samples; rt.dispose(); }
         }
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        this.maxScale = Math.min(dpr, this.q.maxScale);
+        this.maxScale = this.scaleCap();
         this.renderScale = this.maxScale;
         this.applySize();
     }
