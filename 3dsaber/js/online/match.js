@@ -1,7 +1,6 @@
 // ============ A multiplayer match: shared start, live scores, the other players ============
 import { mp } from './multiplayer.js';
 import { RemotePlayers, saberPose } from './remote.js';
-import { settings } from '../settings.js';
 import { audio } from '../audio.js';
 import { esc } from '../ui.js';
 
@@ -24,9 +23,11 @@ export class Match {
         this._live = 0;
         this.onLiveChange = null;     // results screen listens here
         this.names = {};
+        this.looks = {};             // each player's avatar + sabers, as they were when the match started
         for (const uid of game.players || []) {
             const m = mp.lobby && mp.lobby.members && mp.lobby.members[uid];
             this.names[uid] = (m && m.name) || 'Player';
+            this.looks[uid] = (m && m.look) || null;
         }
     }
 
@@ -39,8 +40,9 @@ export class Match {
     // the level is running: show the others and start sending ours
     attach(gp) {
         this.gp = gp;
-        const others = (this.game.players || []).filter(u => u !== mp.uid).map(uid => ({ uid, name: this.names[uid] }));
-        this.remote = new RemotePlayers(this.menu.engine.scene, [settings.get('leftColor') || '#ff2d55', settings.get('rightColor') || '#2d7dff']);
+        // everyone else, as they look (never you: you play from behind your sabers)
+        const others = (this.game.players || []).filter(u => u !== mp.uid).map(uid => ({ uid, name: this.names[uid], look: this.looks[uid] }));
+        this.remote = new RemotePlayers(this.menu.engine.scene);
         this.remote.setPlayers(others);
         this.subs.push(mp.watchLive((v) => this.onLive(v)));
         this.subs.push(mp.watchPoses((v) => {

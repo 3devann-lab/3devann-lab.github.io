@@ -1310,3 +1310,37 @@ body.editing #hud, body.editing #replay-stats, body.editing #countdown { display
     .mp-browser, .mp-lobby-body { grid-template-columns: 1fr; }
     #mp-board { width: 210px; top: 60px; left: 10px; }
 }
+
+/* ============ CUSTOMIZE (sabers + avatar) ============ */
+.custom-screen { position: relative; align-items: flex-start; justify-content: flex-start; padding: 4vh 0 4vh 3vw; }
+.custom-panel { width: min(470px, 94vw); height: 92vh; position: relative; z-index: 2; }
+.custom-panel .panel-header { flex-wrap: wrap; }
+.custom-stage { position: absolute; top: 0; bottom: 0; right: 0; left: min(540px, 42vw); cursor: grab; touch-action: none; z-index: 1; }
+.custom-stage:active { cursor: grabbing; }
+.custom-hint { position: absolute; bottom: 4vh; left: 0; right: 0; text-align: center; color: var(--text-dim); font-size: 14px; pointer-events: none; text-shadow: 0 1px 4px #000; }
+.cu-row { margin-bottom: 16px; }
+.cu-label { font-weight: 700; font-size: 15px; margin-bottom: 7px; }
+.cu-label small { color: var(--text-dim); font-weight: 400; margin-left: 6px; }
+.cu-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.cu-swatches { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+.cu-swatch { width: 28px; height: 28px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.18); cursor: pointer; padding: 0; transition: transform 0.12s; }
+.cu-swatch:hover, .cu-swatch.gp-hover { transform: scale(1.12); outline: none; }
+.cu-swatch.active { border-color: #fff; box-shadow: 0 0 0 2px var(--accent); }
+.cu-custom input { width: 36px; height: 30px; border: 1px solid var(--border-glass); border-radius: 8px; background: none; padding: 1px; cursor: pointer; }
+.cu-slider { display: flex; align-items: center; gap: 10px; }
+.cu-slider input { flex: 1; accent-color: var(--accent); }
+.cu-slider span { min-width: 44px; text-align: right; color: var(--text-dim); }
+.cu-note { color: var(--text-dim); font-size: 13px; line-height: 1.45; margin-top: 8px; }
+.cu-actions { display: flex; gap: 8px; margin: 4px 0 6px; }
+@media (max-width: 980px) {
+    .custom-screen { padding: 2vh 3vw; }
+    .custom-panel { height: 56vh; }
+    .custom-stage { left: 0; top: 58vh; }
+}
+
+.mp-portrait { position: relative; width: 36px; height: 36px; flex: none; }
+.mp-portrait canvas { width: 36px; height: 36px; border-radius: 50%; display: block; }
+.mp-crown { position: absolute; top: -9px; right: -7px; font-style: normal; color: #ffd76a; font-size: 15px; text-shadow: 0 1px 3px #000; }
+.mp-pad { margin-left: 2px; }
+.mp-start-note.warn { color: #ffb02d; }
+.mp-start-note.warn b { color: #fff; }

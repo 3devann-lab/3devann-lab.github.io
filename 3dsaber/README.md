@@ -37,6 +37,18 @@ On the difficulty screen open **Modifiers & Practice**: No Fail, Instant Fail, S
 Ghost Notes, Disappearing Arrows, Small Notes, No Bombs, No Walls, song speed 0.5x–2x, and **Practice from**
 any point in the song. Practice runs and speeds below 1x don't save high scores.
 
+## Customize
+
+**Customize** on the home screen (or in a multiplayer lobby) has a turning 3D preview of your character
+holding your sabers.
+
+- **Sabers**: left and right colours (they colour your notes too), blade (Classic, Beam, Katana, Pixel,
+  Crystal), hilt (Standard, Long, Cross Guard, Ring) and glow. Only the look changes: every blade cuts the same.
+- **Avatar**: head shape, skin, eyes, mouth, headwear (cap, beanie, crown, headphones, horns, halo, antenna,
+  spiky hair, bun), glasses, body, body colour and accent colour, plus **Randomize**.
+- It saves like every other setting (cookie for guests, your account when signed in). **Reset All** in
+  Settings leaves it alone.
+
 ## Accounts & Multiplayer
 
 Turn these on by following **[FIREBASE_SETUP.md](FIREBASE_SETUP.md)** (free, about 15 minutes). Until then
@@ -56,12 +68,16 @@ everyone plays as a guest and multiplayer stays off.
   - Everyone else can **suggest** levels, difficulties and modifiers; the host uses one with one click.
   - Players who don't have the host's level get it **downloaded automatically** (progress shows in the
     player list).
-  - Ready-up and chat.
+  - Ready-up and chat. Each player shows with their avatar's face; the host has a crown.
+  - **Everyone needs a controller.** The host can't start while anyone (the host included) has none
+    connected; the lobby says who. They connect one or leave, or the host removes them (✕).
   - If the host leaves, the player who's been there longest takes over.
 - **Matches**: everyone starts on the same server clock.
-  - You see the other players' sabers moving beside you, with their names and scores, plus a live
-    scoreboard.
+  - The other players stand beside you as their avatars, swinging their sabers in their own colours and
+    blade style, with their names and scores, plus a live scoreboard. You never see your own avatar.
   - Pausing doesn't stop the song (it's shared). At the end the standings update as the others finish.
+  - **If the host leaves mid-match** (Leave Match, closing the game, or losing the connection), the match
+    ends and everyone still playing goes back to the lobby. Anyone else leaving just drops out.
 
 ## Map Editor
 
@@ -192,7 +208,8 @@ or `off` to use only the free public relays. Live and File / Link never need it.
 - `js/replayui.js` — replay viewer controls (timeline, speed, cameras, live options)
 - `js/online/` — accounts and multiplayer: `firebase.js` (loads the SDK), `account.js` (sign in, what's saved where),
   `authui.js` (sign-in screens, Settings → Account), `multiplayer.js` (presence, lobbies, matches), `lobbyui.js` (screens),
-  `match.js` (a running match), `remote.js` (other players' sabers)
+  `match.js` (a running match), `remote.js` (the other players' avatars and sabers)
+- `js/looks.js` — saber styles and avatars (options, 3D models, list portraits); `js/customize.js` — the Customize screen
 - `js/firebase-config.js` — your Firebase project's settings; `firebase/database.rules.json` — the database rules
 - `js/editor/` — map editor: `model.js` (project data, undo, import / export), `view3d.js` (the 3D editing view), `overview.js` (the song strip),
   `editor.js` (screens, tools, playback, 3D preview, saving)

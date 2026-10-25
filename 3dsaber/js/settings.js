@@ -17,6 +17,12 @@ const DEFAULTS = {
     blProxy: '',          // BeatLeader API proxy: '' = built-in worker, a URL, or 'off' (see proxy/README.md)
     trailLength: 0.12,    // saber trail length in seconds (0 = off)
 
+    // your look (Customize): other players see these in multiplayer
+    saberStyle: 'classic', // classic / beam / katana / pixel / crystal
+    saberHilt: 'standard', // standard / long / guard / ring
+    saberGlow: 1,          // 0–2
+    avatar: null,          // looks.js DEFAULT_AVATAR when unset
+
     // thumbstick → saber (the stick places the blade's cutting point on the note grid)
     stickDeadzone: 0.1,   // radial, 0..1
     stickRange: 0.94,     // how far you must push for "full tilt"
@@ -101,6 +107,8 @@ export const REPLAY_KEYS = ['replayCamera', 'replayHud', 'replayCutText', 'repla
     'replayHead', 'replaySkipIntro', 'replayShowMisses', 'replayCutHalves', 'replaySparks', 'trailLength', 'freeCam'];
 export const defaultSetting = (key) => DEFAULTS[key];
 export const ALL_KEYS = Object.keys(DEFAULTS);
+// your saber style and avatar (Reset All leaves them alone)
+export const LOOK_KEYS = ['saberStyle', 'saberHilt', 'saberGlow', 'avatar'];
 export const CONTROL_KEYS = ['stickDeadzone', 'stickRange', 'stickCurve', 'stickSquare', 'saberReachX', 'saberReachY',
     'saberRestHeight', 'saberRestSpread', 'saberSmoothing', 'saberTilt', 'swapSticks', 'invertY', 'rumble'];
 export const MOD_KEYS = ['modSpeed', 'modNoArrows', 'modGhost', 'modDisappear', 'modNoBombs', 'modNoWalls',

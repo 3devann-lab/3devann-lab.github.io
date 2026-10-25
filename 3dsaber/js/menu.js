@@ -3,7 +3,7 @@ import { audio } from './audio.js';
 import { gamepad, cursor } from './input.js';
 import {
     settings, getHighScore, setHighScore, getBestScores,
-    CAMERA_KEYS, CONTROL_KEYS, MOD_KEYS, PLAY_KEYS, VISUAL_KEYS, ALL_KEYS,
+    CAMERA_KEYS, CONTROL_KEYS, MOD_KEYS, PLAY_KEYS, VISUAL_KEYS, ALL_KEYS, LOOK_KEYS,
 } from './settings.js';
 import {
     searchMaps, downloadMap, getSavedMaps, getSavedMap, deleteSavedMap,
@@ -24,6 +24,7 @@ import { account } from './online/account.js';
 import { showAuth, accountSection } from './online/authui.js';
 import { mp } from './online/multiplayer.js';
 import { LobbyUI } from './online/lobbyui.js';
+import { showCustomize } from './customize.js';
 import {
     toast, esc, fmt, settingBuilders, PLAY_CAMERA_ROWS, FIRST_PERSON_ROWS, FOLLOW_ROWS, REPLAY_VIEW_ROWS,
     CONTROL_ROWS, MOD_ROWS, SOUND_ROWS, LOOK_ROWS, HUD_ROWS,
@@ -84,9 +85,11 @@ export class Menu {
             $('hint-confirm').textContent = ps ? '✕' : 'A';
             $('hint-back').textContent = ps ? '○' : 'B';
             toast(`Controller connected${ps ? ' (PlayStation)' : ''}`, 'success');
+            mp.setPad();          // a lobby can't start while someone has no controller
         });
         gamepad.on('disconnect', () => {
             this.updateControllerChip();
+            mp.setPad();
             toast('Controller disconnected', 'error');
             if (this.gameplay && !this.gameplay.replay && !this.gameplay.paused && !this.gameplay.finished && !this.match) this.pauseGame();
         });
@@ -192,6 +195,7 @@ export class Menu {
                 <button class="btn" id="btn-custom">Custom Levels</button>
                 <button class="btn" id="btn-replays">Replays</button>
                 <button class="btn" id="btn-editor">Map Editor</button>
+                <button class="btn" id="btn-customize">Customize</button>
                 <button class="btn" id="btn-settings">Settings</button>
             </div>
         </div>`);
@@ -204,6 +208,7 @@ export class Menu {
         $('btn-replays').onclick = () => this.showReplays();
         $('btn-editor').onclick = () => { this.returnTo = null; this.editor.showProjects(); };
         $('btn-settings').onclick = () => this.showSettings();
+        $('btn-customize').onclick = () => showCustomize(this);
     }
 
     // ============ SONG LIST (Play) ============
@@ -486,6 +491,9 @@ export class Menu {
                     mods: replayModifiers(data.info),
                 };
             }
+
+            // the match was called off while the song loaded (the lobby is already back on screen)
+            if (mpOpts && this.match !== mpOpts.match) return;
 
             this.currentLevel = { builtinSong, record, diff, replayCtx };
             this.setScreen('');
@@ -1508,7 +1516,7 @@ export class Menu {
         b.section('Everything');
         const resetRow = document.createElement('div');
         resetRow.className = 'setting-row';
-        resetRow.innerHTML = `<div class="setting-label">Reset All Settings<small>Back to the defaults (high scores and downloaded maps stay)</small></div>
+        resetRow.innerHTML = `<div class="setting-label">Reset All Settings<small>Back to the defaults (high scores, downloaded maps, your avatar and saber style stay)</small></div>
             <div class="setting-control"><button class="btn small danger" id="reset-all">Reset all</button></div>`;
         body.appendChild(resetRow);
         $('reset-all').onclick = () => {
@@ -1517,7 +1525,7 @@ export class Menu {
                 $('reset-all').textContent = 'Click again to confirm';
                 return;
             }
-            s.reset(ALL_KEYS);
+            s.reset(ALL_KEYS.filter(k => !LOOK_KEYS.includes(k)));
             this.applyAllSettings();
             toast('All settings reset');
             this.showSettings();
