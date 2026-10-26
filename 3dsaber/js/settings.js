@@ -92,7 +92,7 @@ const DEFAULTS = {
     replayCutText: 'total',     // total / split (pre·acc·post) / off
     replayHitSounds: true,
     replayStats: true,          // live per-hand accuracy overlay
-    replayHead: true,           // show the player's head in outside views
+    replayBody: 'avatar',       // who stands where the player was in outside views: avatar (yours) / head / off
     replaySkipIntro: true,      // start a moment before the first note
     replayShowMisses: true,     // red marks on the timeline
     replayCutHalves: true,      // cut notes split into halves while watching
@@ -105,7 +105,7 @@ export const CAMERA_KEYS = ['camFov', 'camHeight', 'camDistance', 'camTilt',
     'fpFov', 'fpPosSmooth', 'fpRotSmooth', 'fpLevelHorizon', 'fpOffsetBack', 'fpOffsetUp',
     'followDistance', 'followHeight', 'followSmooth'];
 export const REPLAY_KEYS = ['replayCamera', 'replayHud', 'replayCutText', 'replayHitSounds', 'replayStats',
-    'replayHead', 'replaySkipIntro', 'replayShowMisses', 'replayCutHalves', 'replaySparks', 'trailLength', 'freeCam'];
+    'replayBody', 'replaySkipIntro', 'replayShowMisses', 'replayCutHalves', 'replaySparks', 'trailLength', 'freeCam'];
 export const defaultSetting = (key) => DEFAULTS[key];
 export const ALL_KEYS = Object.keys(DEFAULTS);
 // your saber style and avatar (Reset All leaves them alone)

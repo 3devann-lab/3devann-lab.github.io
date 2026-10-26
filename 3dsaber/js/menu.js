@@ -1491,7 +1491,7 @@ export class Menu {
 
         b.section('Replays', 'Everything here can also be changed while watching (⚙ Options)',
             resetAndRedraw(['replayCamera', 'replayHud', 'replayCutText', 'replayHitSounds', 'replayStats',
-                'replayHead', 'replaySkipIntro', 'replayShowMisses', 'replayCutHalves', 'replaySparks'], 'Replay options reset')).id = 'sec-replays';
+                'replayBody', 'replaySkipIntro', 'replayShowMisses', 'replayCutHalves', 'replaySparks'], 'Replay options reset')).id = 'sec-replays';
         b.rows(REPLAY_VIEW_ROWS.filter(r => r[1] !== 'trailLength'));
 
         b.section('Graphics').id = 'sec-graphics';
