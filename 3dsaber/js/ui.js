@@ -147,7 +147,7 @@ export const REPLAY_VIEW_ROWS = [
     ['toggle', 'replayHitSounds', 'Hit Sounds', 'Cut and miss sounds'],
     ['toggle', 'replayCutHalves', 'Cut Halves', 'Cut notes split into two flying halves'],
     ['toggle', 'replaySparks', 'Hit Sparks', 'Spark bursts on cuts and bombs'],
-    ['toggle', 'replayHead', 'Player Head', 'Show the head in the outside views'],
+    ['choice', 'replayBody', 'Player', 'Who stands where the player was, in every view but first person', [['avatar', 'Your Avatar'], ['head', 'Head'], ['off', 'Off']]],
     ['slider', 'trailLength', 'Saber Trails', 'Trail length (also used when you play)', 0, 0.4, 0.01, fmt.ms],
     ['toggle', 'replayShowMisses', 'Mistakes on Timeline', 'Marks where notes were missed or bombs hit'],
     ['toggle', 'replaySkipIntro', 'Skip Intro', 'Start a moment before the first note'],

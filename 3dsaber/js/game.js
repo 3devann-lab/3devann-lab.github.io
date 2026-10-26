@@ -11,7 +11,7 @@ import { NOTE_EVENT, FRAME_STRIDE, splitNoteId, cutParts, maxCutScore } from './
 import { audio } from './audio.js';
 import { gamepad, shapeStick } from './input.js';
 import { settings } from './settings.js';
-import { buildSaber } from './looks.js';
+import { buildSaber, buildAvatar, myLook } from './looks.js';
 import { lowMemory } from './device.js';
 
 // ---------- World constants ----------
@@ -2988,12 +2988,16 @@ export class Gameplay {
         };
         this.resetScore();
 
-        // visible head for the outside views
+        // who stands where the player was, in the outside views: your avatar
+        // (Customize) following the recorded head, or just a head
         const visor = new THREE.Mesh(this.engine.assets.head, new THREE.MeshStandardMaterial({
             color: 0x1a1a28, emissive: 0x7c5cff, emissiveIntensity: 0.6, roughness: 0.4,
         }));
         this.headModel = visor;
         this.playerRig.add(visor);
+        this.avatarModel = buildAvatar(myLook(settings).avatar);
+        this.playerRig.add(this.avatarModel.root);
+        this._bodyYaw = null;
         this.freeCam = validFreeCam(settings.get('freeCam')) || { ...FREE_PRESETS.stage };
     }
 
@@ -3166,8 +3170,16 @@ export class Gameplay {
             cam.quaternion.copy(this.engine.camHomeQuat);
         }
         this.engine.setFov(settings.num(mode === 'first' ? 'fpFov' : 'camFov', 30, 140));
-        if (this.headModel) this.headModel.visible = mode !== 'first' && settings.get('replayHead') !== false;
+        this.showReplayBody();
         return mode;
+    }
+
+    // replays: your avatar or the head in every view but first person (Replay → Player)
+    showReplayBody() {
+        const pick = settings.get('replayBody');
+        const outside = this.camMode !== 'first';
+        if (this.headModel) this.headModel.visible = outside && pick === 'head';
+        if (this.avatarModel) this.avatarModel.root.visible = outside && pick !== 'head' && pick !== 'off';
     }
 
     toggleCamera() {
@@ -3222,7 +3234,7 @@ export class Gameplay {
         const trail = settings.num('trailLength', 0, 0.4);
         this.saberLeft.setTrailLength(trail);
         this.saberRight.setTrailLength(trail);
-        if (this.headModel) this.headModel.visible = this.camMode !== 'first' && settings.get('replayHead') !== false;
+        this.showReplayBody();
         this.$('hud').classList.toggle('hud-off', !!this.replay && settings.get('replayHud') === false);
         const sp = this.$('replay-stats');
         if (sp) sp.classList.toggle('hidden', !this.ro.stats);
@@ -3329,6 +3341,25 @@ export class Gameplay {
             this.headModel.position.copy(P.head.pos);
             this.headModel.quaternion.copy(P.head.quat);
         }
+        if (this.avatarModel && this.avatarModel.root.visible) this.poseAvatar(P.head);
+    }
+
+    // The avatar's head sits on the recorded head; its body hangs below and
+    // turns with where the player faces (smoothly, so head shakes don't spin it)
+    poseAvatar(head) {
+        const av = this.avatarModel;
+        _e.setFromQuaternion(head.quat, 'YXZ');
+        const yaw = _e.y;
+        if (this._bodyYaw == null || this._camSnap) this._bodyYaw = yaw;
+        else {
+            let d = yaw - this._bodyYaw;
+            d = Math.atan2(Math.sin(d), Math.cos(d));
+            this._bodyYaw += d * 0.12;
+        }
+        av.root.position.set(head.pos.x, head.pos.y - 1.68, head.pos.z);
+        av.root.quaternion.setFromAxisAngle(UP, this._bodyYaw);
+        // the head keeps the rest of the recorded rotation, relative to the body
+        av.head.quaternion.copy(av.root.quaternion).invert().multiply(head.quat);
     }
 
     resolveReplayNotes(t) {
@@ -3545,6 +3576,7 @@ export class Gameplay {
         this.saberLeft.dispose();
         this.saberRight.dispose();
         if (this.headModel) { this.headModel.removeFromParent(); this.headModel.material.dispose(); }
+        if (this.avatarModel) { this.avatarModel.root.removeFromParent(); this.avatarModel.dispose(); this.avatarModel = null; }
 
         // restore camera from the head rig
         if (this.replay) this.saveFreeCam();

@@ -45,7 +45,8 @@ holding your sabers.
 - **Sabers**: left and right colours (they colour your notes too), blade (Classic, Beam, Katana, Pixel,
   Crystal), hilt (Standard, Long, Cross Guard, Ring) and glow. Only the look changes: every blade cuts the same.
 - **Avatar**: head shape, skin, eyes, mouth, headwear (cap, beanie, crown, headphones, horns, halo, antenna,
-  spiky hair, bun), glasses, body, body colour and accent colour, plus **Randomize**.
+  spiky hair, bun), glasses, body, body colour and accent colour, plus **Randomize**. Other players see it in
+  multiplayer, and it stands in for the player when you watch a replay from outside.
 - It saves like every other setting (cookie for guests, your account when signed in). **Reset All** in
   Settings leaves it alone.
 
@@ -144,7 +145,10 @@ A control bar appears at the bottom whenever you move the mouse, pause, or hover
   - **Follow**: distance, height, smoothing.
   - **Third person**: field of view, height, distance, tilt.
   - **Replay**: score HUD, cut scores (`115` or `70 · 15 · 30`), stats panel (per-hand average, pre/acc/post swing,
-    mistakes), hit sounds, player head, saber trail length, timeline marks, skip intro, playback speed.
+    mistakes), hit sounds, player, saber trail length, timeline marks, skip intro, playback speed.
+- **Player** (Options → Replay, or Settings → Replays): in every view except first person, **your avatar** from
+  Customize stands where the player was. Its head follows the recorded head and its body turns to face where
+  the player looks. **Head** shows just a head, **Off** shows nobody.
 
 Everything is remembered for the next replay and can also be set in **Settings**.
 
